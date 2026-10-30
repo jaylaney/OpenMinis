@@ -1,0 +1,235 @@
+# OpenMinis remote execution on Mac
+
+Date: 2026-10-30
+Revision: 3 — external Tailscale and manual hosts, with follow-up review of revision 2 applied.
+Status: Revised design draft. Document revision is authorized; implementation and live setup are separate work.
+Source baseline: `1a71df0f381cefde80bf912b723de6f9831bc177`.
+
+The [companion review](2026-10-30-remote-execution-design-review.md) evaluates the original 201-line draft. Its line numbers refer to that draft, not this revision. The disposition table below records how its findings are handled; the review itself remains unchanged.
+
+## Intent and accepted direction
+
+Extend OpenMinis with a custom iOS build and a native macOS companion. When creating a chat on the iPhone, choose this phone or a saved Mac as the execution environment. A Mac chat runs OpenMinis' own agent on the Mac; the phone displays and controls it.
+
+The user selected OpenMinis' own agent, an OpenMinis extension, away-from-home access through Tailscale, and terminal/file access initially. The revised direction uses the separately installed Tailscale apps on both devices and a manually entered Mac Tailscale address. Automatic iCloud discovery is deferred. Keep one-time application authorization: a network address is not an execution credential.
+
+Goals: visibly bind each chat to one execution host; run the full agent loop and tools there; stream progress and approvals; stop work; reconnect without duplicating it; preserve existing local iPhone behavior.
+
+Initial exclusions: embedded tsnet; our own relay; automatic host discovery; remote control of the phone; desktop/screen/browser automation; interactive PTY; unattended startup; waking a sleeping Mac; live session migration; offline execution queues; automatic rerun after crashes; existing-agent adapters; other operating systems.
+
+The following are author-proposed delivery defaults, not additional user decisions: one enrolled phone/controller per Mac; multiple locally saved Macs; one active run per Mac with no prompt queue; one existing API-key provider for the first real-agent milestone; per-action approval by default with an explicitly enabled run-scoped mode; a local user-presence check (biometric or passcode) before enabling that mode, with none required per approval. These keep the first slice bounded and are reviewable before implementation planning.
+
+## Approaches and selection
+
+| Approach | Tradeoff | Decision |
+| --- | --- | --- |
+| Shared OpenMinis agent and platform runtimes | Refactor existing orchestration, while keeping one agent implementation. | Selected. |
+| Mobile frontend for existing Mac agents | Requires adapters and differing session/approval semantics. | Not selected. |
+| Standalone new product | Adds independent product and infrastructure work. | Not selected. |
+| External Tailscale plus saved endpoint | Manual network setup; ordinary native sockets; no new embedded-node integration. | Selected for v1. |
+| Embedded tsnet plus iCloud registry | Automatic discovery and in-app networking, but new iOS UI/lifecycle/FFI and Mac packaging. | Deferred; not assumed cheaper because Go source exists. |
+| Application relay or CloudKit command mailbox | Adds server operation or delayed command-delivery/replay semantics. | Excluded. |
+
+Use a native Swift macOS companion with native process/file adapters. Mac Catalyst is an alternative worth a bounded dependency/spawn feasibility assessment if planning uncovers a compelling saving; it is not assumed to support the desired execution model. Running the existing Designed-for-iPad app on Mac does not establish native host capability. Do not replace the selected architecture with Catalyst without reporting the evidence and scope change.
+
+## Source baseline and corrections
+
+These are source observations, not build/device results:
+
+- [`AIChatViewModel.swift`](../../../src/ios/Agent/Chat/AIChatViewModel.swift) combines UI, orchestration, persistence, and tools. [`AIChatViewModel+AgentLoop.swift`](../../../src/ios/Agent/Chat/AIChatViewModel+AgentLoop.swift) imports UIKit and documents a roughly 2,000-line loop requiring refactoring.
+- [`AIChatViewModel+ISHCommand.swift`](../../../src/ios/Agent/Chat/AIChatViewModel+ISHCommand.swift) uses `ISHExecutionCoordinator`; [`AIChatViewModel+FileTools.swift`](../../../src/ios/Agent/Chat/AIChatViewModel+FileTools.swift) assumes iSH fakefs. Native Mac adapters and a host-aware system prompt are necessary.
+- [`tsnet.go`](../../../deps/rclone-mobile/tsnet/tsnet.go) and its C exports exist, but this checkout has no Swift/Objective-C Tailscale callers. [`build_rclone_ios.sh`](../../../deps/build_rclone_ios.sh) produces iOS slices only. This is backend source, not a working iOS networking integration. None is required for external Tailscale v1.
+- [`UploadPolicy.swift`](../../../src/ios/Agent/Sync/V2/UploadPolicy.swift) defaults upload categories on, while [`SyncV2Bootstrap.swift`](../../../src/ios/Agent/Sync/V2/SyncV2Bootstrap.swift) defaults overall CloudKit sync off on fresh installations and inherits existing preferences. [`ProviderConfigStore.swift`](../../../src/ios/Providers/ProviderConfigStore.swift) writes API keys with `kSecAttrSynchronizable = true`. The old draft's blanket description of opt-in credential sync was inaccurate; cross-app delivery also depends on access groups and enabled sync.
+- [`DeviceIdentity.swift`](../../../src/ios/Shared/DeviceIdentity.swift) is a Keychain UUID, not cryptographic authority. Locked/unreadable Keychain does not rotate the real identity. [`LANTransport.swift`](../../../src/ios/Agent/Sync/V2/LANTransport.swift) is unimplemented.
+- Existing peer-session UI and [`SessionForkManager.swift`](../../../src/ios/Agent/Session/SessionForkManager.swift) create local copies. Hosted sessions must not enter those legacy paths.
+- [`UserAskCenter.swift`](../../../src/ios/Agent/Chat/UserAskCenter.swift) posts local notifications from running app code; it cannot notify a suspended remote client by itself. [`UserAskCore.swift`](../../../src/ios/Agent/Chat/UserAskCore.swift) explicitly reports timeout as nothing applied or approved.
+
+## Components and incremental extraction
+
+The phone gets a local-session backend and a remote-session backend. Remote sessions never instantiate a local executing loop. The Mac owns model calls, tools, admitted history, approvals, and persistence. The phone owns drafts, view preferences, and a non-authoritative cache.
+
+Extract shared orchestration behind explicit provider, storage, tool-runtime, event, and approval interfaces. UIKit, speech, permission presentation, iSH, and platform lifecycle remain in adapters. Make each extraction behavior-preserving on iOS; add characterization coverage before moving behavior. A synthetic transport stub is allowed for qualification, but is not a second production agent loop.
+
+First prove the native connection and durable run protocol independently. Then extract the smallest vertical slice supporting the selected API-key adapter, text conversation, same-provider request retry, native shell/files, and user questions. Compaction follows as its own step before combined qualification; title generation is deferred. Do not require the entire current agent surface to be portable before testing anything on Mac. Future retry, compaction, cancellation, and history changes should update one shared implementation and exercise both adapters; platform exceptions must be explicit capabilities.
+
+The Mac app provides hosting controls, pairing/revocation, provider/workspace setup, active-run status, local approvals/Stop, and diagnostic status. It is initially a host/settings app rather than a full desktop chat interface. Closing a settings window leaves hosting active; explicit Quit shuts it down.
+
+## External Tailscale and connectivity
+
+Both devices use the separately installed Tailscale clients. The app does not manage login, node keys, expiry, routing, or embedded-node state. The user enables Tailscale and permits the service through tailnet policy. The phone saves a Mac tailnet IP and service port; a name can be supported later without changing host identity.
+
+Use ordinary native TCP/TLS networking over the system route. Bind the Mac listener to its selected Tailscale address, not every LAN interface. If that address disappears, stop listening and report unavailable. Do not expose Funnel, public forwarding, or silently try LAN/public addresses. No Swift/Go byte-stream bridge, app-managed tsnet listener, or new Go networking archive is required.
+
+Distinguish transport timeout/unreachable, TLS identity mismatch, unapproved controller, incompatible protocol, and host busy. Without privileged Tailscale diagnostics the app may not know whether a timeout means VPN off, a different tailnet, policy denial, sleep, expiry, or outage; present these as troubleshooting possibilities rather than invented diagnoses. Re-login and expiry settings belong in Tailscale. A live authenticated capability check, not a saved last-seen time, makes Send available.
+
+The Mac must be running and reachable. The phone may disconnect while accepted work continues. Tailscale's network encryption does not keep model requests local: the Mac sends permitted context to its selected model provider. Logging/privacy settings of the external Tailscale clients are separate from our application logs. Application logs default to operational IDs and states; redact enrollment secrets, credentials, authentication material, raw prompts, and full command/file contents. Inspect retained integration logging before claiming this privacy contract is satisfied.
+
+## Enrollment, identity, and revocation
+
+Use per-installation application identity keys, stored under new non-synchronizable Keychain service names/access groups appropriate to these signed builds. A stable opaque host ID is bound to its approved key; neither the existing UUID, display name, IP nor Tailscale membership grants application authority. Deriving the ID from the key is optional; silent key replacement is forbidden.
+
+Manual enrollment:
+
+1. Locally enable hosting and open a short pairing window on the Mac. Display its endpoint and a one-time invitation containing the full host-key fingerprint and a high-entropy enrollment secret. Offer it as both a QR code and copyable text, using system frameworks with no new dependency; the builder chooses the encoding. Pairing must not depend on Universal Clipboard, which needs a shared Apple account that remote execution does not otherwise require.
+2. Scan the QR code, or enter the endpoint and invitation as text if the camera is unavailable or denied. The phone verifies the Mac TLS key against that fingerprint before transmitting enrollment data. Never globally accept an untrusted certificate or send chat data during tentative enrollment.
+3. In the encrypted enrollment exchange, present the phone's identity key and invitation secret. Require local confirmation on the Mac before storing that exact controller key. Consume the invitation once; close the pairing window. Expiry and rate limits are mandatory, with concrete values selected in planning.
+4. Retain the Mac key pin on the phone and the controller allowlist on the Mac. Normal connections require mutual application authentication. A changed IP may be edited without changing the pin; a changed key requires new enrollment.
+
+Outside pairing, reject unknown keys before exposing sessions/tools. Bound unauthenticated parsing and requests. Use standard TLS and platform trust APIs, with explicit pinned-peer validation. Keys stored in Keychain may be used in memory by TLS; this design does not require nonexportable hardware keys or a Go signer bridge.
+
+One enrolled controller per host is the proposed v1 limit. Replacing it requires local Mac action. Local Mac approval and Stop always work without a connected phone. Revoking a controller first blocks new admissions and invalidates its grants/approvals, then closes connections and cancels its managed run. Store controller/run ownership explicitly even with this initial limit.
+
+An unlocked enrolled phone has control authority. Fresh human presence for every approval is not promised; adding it is a separate product/security choice. Enabling a run grant is the exception: it requires the local user-presence check described under the approval policy. Remote removal of a lost phone through Tailscale can cut future connectivity, but is not application revocation and does not stop an already admitted run. The Mac app remains the authoritative revocation/Stop path initially.
+
+Protect secrets and allowlist integrity with Keychain and careful storage; scrub child-process environments. These measures do not isolate the host from arbitrary approved shell code running under the same OS user. Such code can compromise user-owned app files or persistence. Do not promise that Keychain, HMACs, or encryption alone prevent this. Strict same-user-shell isolation would require a separately selected OS boundary before making that guarantee.
+
+## iCloud and credential boundaries
+
+Automatic iCloud host registration and all hosted transcript/secret sync are deferred. The Mac does not start existing `SyncCore` or `CloudSyncEngine`, reuse `SyncDeviceV2`, or call existing synchronizable credential writers. Configure the initial API key locally on Mac using separate non-synchronizable storage. Existing local iPhone sync behavior remains unchanged.
+
+The remote execution path itself does not require the same Apple account. Optional background attention notifications do: both builds must access the same developer-owned private CloudKit container/account and environment. No access to upstream OpenMinis containers is assumed.
+
+Use only a separate `ExecutionAttentionV1` record/subscription path for that optional feature. Store opaque recipient/host/session identifiers, event kind/nonce, and time; no commands, file paths, prompts, secrets, or approval decisions. CloudKit/APNs may display a generic alert such as “A Mac task needs attention.” Opening it connects to the pinned host and fetches current state. A notification never authorizes an action, supplies an approval body, or becomes an execution mailbox.
+
+Notifications are best effort and may coalesce. A missed/delayed/duplicate/stale hint must be harmless. On reopen, fetch all actual outstanding attention from the host. Without notification permission, iCloud access, or successful setup, show “background alerts unavailable”; the remote feature still works while open, and unattended runs may wait silently for the user to return. No automatic approval or retry compensates for missing alerts.
+
+Custom-signing inventory includes fixed app-group and container identifiers, Keychain groups/service names, `CKContainer.default()` callers, HealthKit/HomeKit/NFC/WeatherKit capabilities, and extension targets. Keep the optional attention writer separate from ordinary sync even when sharing a container. Physical qualification must use matching CloudKit development/production environments with the schema deployed as appropriate. Disabling attention must not disable manual host access.
+
+## Session authority, journal, and reconnect
+
+A host session has an immutable execution host ID/key binding separate from legacy `remoteDeviceId` or sync-origin metadata. Existing local sessions retain existing behavior. No in-place host migration or legacy Fork Session path is offered for hosted chats.
+
+Proposed v1 concurrency: one active run per Mac, no admitted prompt queue, and one controlling phone. A send while busy is explicitly rejected; its text remains a phone draft. A run waiting for a user decision holds the active slot only until that decision expires, so one ignored request cannot block the Mac indefinitely. The phone can save multiple Macs and each host can retain multiple idle sessions. This deliberately narrows existing iOS prompt-queue behavior without changing local iOS sessions.
+
+Use one host-local durable authority for admission, canonical transcript, run/approval state, and events. Prefer admission/journal tables in the same SQLite transaction domain as host chat persistence. If a different storage design is chosen, the plan must specify recovery across its writes before it is accepted. Generic last-write-wins cloud records are never an authority for a running session.
+
+Each mutating request has an authenticated storage epoch, stable request ID, session/run ID, and payload fingerprint. Persist admission before any side effect; repeated identical IDs return recorded status, while changed payloads are rejected. Persist terminal rejections of valid authenticated requests, including busy responses, as well as admissions: retrying an ID rejected as busy must not execute later when the host becomes idle. An explicit later Send uses a new ID. A lost acknowledgment causes status lookup or retransmission of the same request, not a new request ID. Unknown execution outcome is never interpreted as failure-to-start.
+
+Retain admission/dedupe metadata for the session lifetime, independently of compacted event payloads. Deleted sessions keep tombstones or an equivalent rejection boundary so old requests cannot recreate them. Every database loss/reset requires a fresh unpredictable storage epoch, authenticated by the pinned host, or a genuinely new host identity. Re-enrollment alone is insufficient if the old host key survives. Reject requests from earlier epochs before admission, even if the session/request ID is unknown in the new database. The phone must not relabel old pending mutations with the new epoch; restoring service requires an explicit new-session action after acknowledging the reset.
+
+The host assigns monotonic event cursors within its storage epoch. Reconnect asks for changes after the last committed cursor, or a consistent snapshot plus new cursor when deltas have expired. Coalesce token output for persistence; clients may see uncommitted partial text disappear after a crash. Retain committed partials with an interrupted label. Never automatically replay a model request or tool after host restart; a new user turn intentionally repeating work can incur a new provider charge and repeat external effects. Dedicated rerun/edit-history controls remain deferred as specified below.
+
+After unclean host termination, keep execution admission recovery-blocked until previous managed process groups have been reconciled/terminated or verified absent. An ordinary child may survive its parent without deliberately detaching; marking its run interrupted does not free the active slot. Process cleanup must verify ownership and process lifetime/boot identity, not kill a raw reused PID. The launch/journal design must account for failure between spawn and recording ownership. If safe reconciliation is impossible, expose unresolved recovery and refuse new execution until absence is established through a reliable local recovery procedure; a mere acknowledgement is not proof that the old process ended. A fresh storage epoch prevents request replay but does not itself settle surviving processes.
+
+Connection state is separate from execution state. Preserve unsent drafts offline, with no hidden delivery queue. If admission is uncertain, resolve the original request against the host before offering a normal resend. Missing/reinstalled hosts remain unavailable, even if a replacement has the same name/IP.
+
+## First-release capability matrix
+
+This matrix defines the proposed first release, not complete future Mac parity. Rows belong to the first agent milestone unless they name a later step. Unsupported controls are hidden/disabled with a reason before a request is accepted; never run them locally as a substitute.
+
+| Feature | Initial Mac session behavior |
+| --- | --- |
+| Text conversation and streamed tool results | Shared agent orchestration runs on Mac; events displayed on phone. |
+| `shell_execute`, `file_read`, `file_write`, `file_edit` | Native Mac adapters behind the host approval/access rules. |
+| Directory listing / transfers | Listing through host file service or shell; transfer is explicit client UI/protocol, not an invented existing model tool. |
+| `user_ask` | Host-owned question state; protocol for questions/answers/timeouts distinct from tool authorization. Timeouts behave as on iOS, except that Mac sessions always use a bounded timeout. |
+| Provider/model | One existing API-key adapter selected by the plan, with explicit supported models. OAuth and remote credential editing deferred. |
+| Model groups / provider fallback | Disabled for initial remote slice; reject unsupported configurations. Preserve local iOS group behavior. No added cross-provider or cross-host fallback. |
+| Retry, thinking level | Host-owned. Preserve supported same-provider request retry behavior within an active run, with no automatic tool rerun or restart recovery. Expose supported settings/actions through protocol; idle model changes affect future requests and preserve history. |
+| Compaction | Host-owned, using the shared implementation, in its own step after the first agent milestone and required before combined qualification. Until then, a chat reaching the context limit stops with an explicit error and keeps its history. No Mac-only summarizer. |
+| Title generation | Deferred. The Mac names a chat from its first message. |
+| Session list/load/rename/delete | Through host protocol, with cached offline list/history. Active-session delete requires Stop/settlement first. |
+| Edit/rerun/delete-from-message/tool-block replay | Deferred for remote slice; no UI path may call local implementations. New sessions and ordinary subsequent turns are supported. |
+| Prompt queue / parallel turns / multiple controllers | Deferred; busy sends are rejected and remain drafts. |
+| Sub-agents, MCP, skill loading, structured memory tools | Disabled in first remote slice; no partial promise of configured agents/skills without their approval/cancellation semantics. |
+| `read_image`, image-model input, voice | Deferred. Arbitrary transferred files can be stored but are not silently inserted into model context as supported media. |
+| Browser, screen, Accessibility, phone integrations | Disabled on Mac; local phone sessions retain existing capabilities. |
+| Slash commands and `@` mentions | Only capability-declared remote commands; local file mentions/unsupported actions disabled initially. |
+| System prompt | Host-aware macOS shell/paths/tools; remove Alpine/iSH/package-install claims and phone-only links/integrations. |
+
+## Cache, files, and resource resolution
+
+Keep a non-synced phone cache keyed by host identity and session ID. It stores host-confirmed list entries, committed transcripts, and explicitly fetched artifacts for offline viewing. It never contains a runnable agent history or authority to submit work. Reconnect reconciles cursor/snapshot state rather than creating local turns.
+
+Exclude this cache from `sync_dirty_records`, normal chat backups/restores, legacy remote-session lists, fork actions, and local execution/usage accounting. Initially exclude it from global local-chat search; offline host chat lists/history remain readable with a stale/offline label. Display host-reported remote usage separately so it is not double-counted. Clearing a cache does not delete host data; host deletion eventually removes corresponding cached content.
+
+Resolve links, attachments, offloaded output, and file actions in the session's host namespace. A remote `minis://` reference must never fall through to phone-local resolution. Use host/session-scoped resource descriptors and explicit authenticated fetches; the builder chooses the URI encoding. Legacy unscoped links are resolved only through their associated host session or shown unavailable. Disable local mention indexing in remote chats.
+
+Structured file reads/writes operate within Mac-selected workspace roots, including symlink/path-traversal enforcement. Present macOS paths. Generated files remain on Mac; downloading/uploading is explicit, with bounded sizes and no implicit overwriting of an existing file. File-service descriptors identify the resource and host/session and are validated server-side on every access. These roots constrain structured file tools, not arbitrary shell commands.
+
+## Approval policy and tool concurrency
+
+Default: each shell invocation and mutating file operation requires approval of its immutable command/change, working directory, host, session/run, and invocation ID. Structured reads within approved workspace roots need no per-read prompt. An approval is single-use with expiry; editing the action or deliberately rerunning requires a new decision.
+
+Proposed optional mode: explicitly authorize one run to execute this declared tool set without further per-action prompts until that run ends, the grant expires, Stop occurs, or authorization is revoked. Do not enable it automatically or persist it to later runs. Its consent must state that ordinary shell commands have the Mac user's permissions, may operate beyond the working folder, and can compromise user-owned host state, including this app's own files, in ways that persist after the run. This is a broader run grant, not a claim of path-enforced shell safety. The phone requires a biometric or passcode check immediately before sending the grant; if the check fails or the device has no passcode, the grant is not offered and per-action approval continues. This check is local to the phone: it guards against casual use of an unlocked device, and the host does not verify it cryptographically. If the user does not accept this mode, per-action approval remains sufficient for v1, with more pauses.
+
+Grant expiry prevents new effectful invocations without a decision: an already admitted command may finish under its own timeout, and the next effectful action returns to per-action approval. Stop, explicit grant revocation, or controller revocation instead cancels the active managed run. Pending per-action approval expiry means that particular action was never admitted; it does not undo previously completed effects.
+
+A pending approval or question produces host `waiting for user` state and an optional attention hint. Disconnect does not approve or deny it. Reopening obtains current state.
+
+On approval expiry, record an explicit timeout indicating nothing was applied/approved, synthesize terminal results for the run's unsettled tool calls so the history stays valid for the provider, end the run, and free the active slot. Do not call the model to find another route around approval. There is no paused-run state and no resume operation: the user continues with an ordinary new turn, and any repeated action needs a fresh approval.
+
+A `user_ask` timeout keeps the shared iOS behavior: the model receives a timeout result stating that nothing was applied or approved, plus any unconfirmed suggestion, and the turn continues. Any effectful action it then proposes still needs its own approval. Unlike iOS, where a question can wait indefinitely, Mac sessions always use a bounded timeout because a waiting run holds the active slot. A `user_ask` answer never substitutes for execution authorization.
+
+Denial stops that run after managed work is settled. Pending effectful calls are cancelled; no provider continuation routes around the denied action. Preserve terminal tool results in original tool-use order. Continuing afterwards is an ordinary new user turn, and a repeated action needs a fresh decision. This remote policy is adapter-specific; existing iOS local semantics are not silently changed.
+
+For the first Mac adapter, serialize effectful tool admission in original tool-use order even when the shared loop dispatches concurrently. Ask one per-action approval at a time. Independent reads may run concurrently; all results retain model-required order. Cancelling/denying an action cancels unsettled sibling work, waits for it, and records already-completed effects truthfully. Run grants remove prompts but retain admission ordering and supervision.
+
+## Process lifecycle, cancellation, and platform access
+
+Run native commands without root or automatic privilege escalation. A working directory is not a shell sandbox. Commands can access other user-accessible files, invoke installed programs, and affect user-owned host state. Dedicated GUI tools are absent, but a shell command is not guaranteed unable to invoke an automation utility; OS permissions govern it.
+
+Use a supervised process group, explicit child ownership, noninteractive stdin from `/dev/null`, and a minimal documented environment without inherited model credentials, application keys, or control sockets. Do not assume `Foundation.Process` automatically supplies the required group semantics. Proposed initial limits: 900-second command wall time, 64 KiB inline combined output, and at most 16 MiB retained output per command; reaching the retained limit terminates the command with an explicit output-limit result. Review these limits during planning, not after unbounded execution exists.
+
+On Stop, the phone says `stop requested` until host confirmation. The host blocks new effects, invalidates grants/approvals, cancels provider streams/retries, and terminates managed processes: graceful termination, then force after five seconds. Settle/join managed work, persist terminal/interrupted state, and emit its event. Stop has no queued prompt to restart in this v1; preserve existing local iOS queue behavior.
+
+Completed changes are not undone. Detached daemons and work handed to external services cannot be claimed stopped merely because the managed group ended; persistent background jobs are unsupported. A crash/forced exit may leave unknown effects: report them and do not auto-rerun.
+
+The proposed ordinary-user executor is a directly distributed, appropriately signed native Mac build with App Sandbox disabled, not a Mac App Store target. Sandboxed process children inherit restrictions, so strict sandboxing is a separate runtime choice. Keep OS privacy restrictions: do not automatically request Full Disk Access or Accessibility. Workspace/provider setup should check required file access locally before travel. Later TCC/UI authorization failures or timeouts must become a visible blocked/error state, never an invisible indefinite wait or privacy bypass; exact behavior needs signed-device qualification.
+
+Hold an appropriate activity/idle-sleep assertion while an active run or pending user decision needs hosting, then release it on completion/expiry/Stop. Do not hold the machine awake merely because hosting is enabled. User-forced sleep, power loss, and lid/display configurations can still affect availability; no wake guarantee is made. On return, report actual interrupted/unknown state rather than resuming effects automatically.
+
+Disable hosting/Quit first rejects new work and cancels/settles its managed run before normal exit. Local Mac controls remain available. Abrupt termination is recovered as interrupted/unknown. Device lock does not by itself cancel an authorized run; later Keychain/TCC failures surface explicitly.
+
+## Delivery sequence and evidence gates
+
+These are design gates for the later plan, not authorization to execute now:
+
+1. **Signed transport slice:** minimal Mac service and iOS remote backend with synthetic events over external Tailscale/native TLS. The stub issues scripted tool actions, with no model, and runs real commands under the native process supervisor. Prove one-time enrollment, host pinning, durable request admission, per-action approval and its expiry, reconnect, Stop settling real process groups, and recovery after killing the host mid-command, including the spawn/journal failure window and refusal of new execution until surviving children are reconciled. Use a real iPhone on cellular and the awake Mac before changing the production agent loop. A simulator or unsigned harness is not acceptance.
+   **1b. Attention notifications:** add the optional CloudKit path separately, so that its entitlements, schema, and push setup cannot block gate 1 or later gates. Establish which subscription type can deliver the visible generic alert to a locked phone; this is not yet proven. If none can do so dependably, ship the “background alerts unavailable” state rather than presenting silent push as an alert.
+2. **Behavior-preserving seams:** characterize the chosen iOS path before each extraction; keep local provider/history/retry/compaction/tool/cancellation behavior. Specify the capability and signing/dependency inventory. Existing device-only iSH dependencies limit simulator builds; use appropriate source/unit/physical evidence without claiming simulator coverage that does not exist.
+3. **First native agent slice:** one supported API-key provider, text chats, same-provider request retry, native shell/files, user questions, approvals, durable host storage, separate phone cache, and scoped resources. Reaching the context limit stops the chat with an explicit error. Qualify a disposable workspace under actual signed Mac permissions.
+4. **Shared compaction:** extract compaction behind the shared interfaces, characterizing the iOS path first, and enable it for Mac sessions. Long Mac chats continue past the context limit using the same implementation as iOS.
+5. **Combined qualification:** exercise physical away-from-home use, phone suspension, host sleep/restart, request/notification duplication, denied/expired approvals, signed app dependencies, and existing local iSH networking (`apk`, `pip`, `git`) with the Tailscale VPN on, since the phone now keeps it on and [`NetworkMonitor.swift`](../../../src/ios/Shared/NetworkMonitor.swift) already records Tailscale DNS breaking those tools. Only then evaluate broader provider/tool coverage or automatic discovery as separately scoped work.
+
+If retained native libraries contain Go, verify actual signed launch and avoid linking multiple Go runtimes into one process. External Tailscale introduces no new in-process Go runtime; there is no reason to add one merely for transport. Existing rclone/iSH and signing issues still require an inventory rather than being assumed solved by this network simplification.
+
+Required adversarial/recovery evidence: unapproved peer and wrong host key refused; pairing secret expiry/replay/impersonation refused; revocation prevents further admissions; repeated request IDs and lost acknowledgments do not rerun effects; a busy rejection remains rejected on retry after idle; deleted-session and pre-reset-epoch retries remain rejected; crash between effect and result remains unknown; surviving managed children block new execution until safely reconciled, including the spawn/journal failure window; replay/cache cannot activate local execution; wrong-host links never open local files; expired/denied concurrent actions cannot route around authorization; run-grant expiry admits no new effects and differs from Stop/revocation; an expired approval ends the run, frees the active slot, and leaves history the provider accepts on the next turn; a timed-out `user_ask` approves nothing; phone locked at first tool call gets best-effort attention and otherwise waits; missing iCloud/notifications do not break foreground use; tailnet policy/network failure has no routing fallback; TCC failures, command/output limits, idle sleep, and managed process termination report truthful states; application logs respect the redaction contract.
+
+Use disposable app identities, test workspaces, and credentials. No personal documents or production app data are required. Separate static/source evidence, automated fixtures, signed launch results, and physical-device acceptance. This revision has involved document/source review only, with no builds, tests, probes, enrollment, or runtime claims.
+
+## Disposition of the original review
+
+| Finding | Revision disposition |
+| --- | --- |
+| 1, 13, 17 | External Tailscale/manual endpoint removes embedded-node integration, FFI/TLS bridging, and app-managed node policy from v1. Connectivity diagnostics remain deliberately limited. |
+| 2 | Best-effort content-free CloudKit attention, explicit no-alert state, approval expiry that ends the run, and proposed optional run grant. |
+| 3 | Transport-first signed physical milestone and incremental extraction; Catalyst considered without assuming viability. |
+| 4 | Correct category/global sync defaults and synchronizable Keychain facts; Mac excluded from existing sync and credential writers. |
+| 5 | Explicit invitation/bootstrap, pairing window, mutual authentication, and persisted phone-side host pin. No iCloud registry authority. |
+| 6 | Same-user shell compromise is acknowledged; Keychain/integrity hardening is not represented as an isolation boundary. |
+| 7 | Unlocked-controller authority and recovery stated; a local user-presence check gates run grants, not individual approvals, and no second approval key is used; Tailscale node removal is not Stop/revocation. |
+| 8 | Explicit initial tool/control/provider matrix and host-aware prompt. |
+| 9, 10 | Unsynced, non-runnable phone cache, excluded backup/fork/accounting paths, and host-scoped resource resolution. |
+| 11, 12 | Native distribution/access/process/power contracts; bounded output/time; ordered approvals and settled siblings. Platform outcomes require qualification. |
+| 14 | One controller and active run per host, no prompt queue, local Mac controls, explicit ownership. |
+| 15 | One durable transaction authority, recorded terminal rejections, dedupe lifetime/deletion boundary, authenticated reset epochs, cursor snapshots, no automatic model/tool replay, and reconciliation of surviving managed processes before new execution. |
+| 16 | API-key provider first, OAuth/groups deferred; local iOS fallback preserved. |
+| 18 | Custom signing/capability/access-group/container inventory retained; attention has its own CloudKit path. |
+| 19 | Signed/physical transport gate and expanded recovery/access/cache qualification. No hostile-shell isolation guarantee is invented. |
+| 20, 21 | Stable host ID bound to pinned key, no dependency on rotating sync UUID; discovery record deferred, separate attention type only. |
+
+## Remaining planning choices
+
+Choose concrete module/API boundaries, framing/version compatibility, TLS/platform key integration, pairing encoding/limits, the existing API-key adapter, transaction schema, cursor retention/coalescing, deployment targets, and signed-build configuration. These choices must satisfy the contracts above; do not silently add OAuth, queues, cross-device tools, cloud discovery, or a shell-isolation promise.
+
+User review should particularly consider the proposed run-grant option, ordinary-user shell authority, one-controller/one-active-run limit, initial API-key-only capability surface, optional background alerts, and no PTY. Neither revising nor committing this document authorizes product code, build setup, provisioning, live network changes, or publication. After design review/approval, write a bounded implementation and verification plan.
+
+## References
+
+- [Original design review](2026-10-30-remote-execution-design-review.md); dispositions above qualify recommendations rather than adopting every prescription.
+- [Tailscale: connect to devices](https://tailscale.com/docs/how-to/connect-to-devices) and [iOS setup](https://tailscale.com/docs/install/ios): external client/network setup and stable tailnet endpoints.
+- [Apple Process](https://developer.apple.com/documentation/foundation/process): child-process environment and sandbox inheritance.
+- [Apple idleSystemSleepDisabled](https://developer.apple.com/documentation/foundation/processinfo/activityoptions/idlesystemsleepdisabled): activity option for the proposed active-run policy.
+- [Apple CKDatabaseSubscription](https://developer.apple.com/documentation/cloudkit/ckdatabasesubscription): notifications can coalesce; fetch authoritative state instead of relying on one notification per change.
+- [Apple userPresence](https://developer.apple.com/documentation/security/secaccesscontrolcreateflags/userpresence): user presence can be biometric or passcode; it does not mean mandatory Face ID.
