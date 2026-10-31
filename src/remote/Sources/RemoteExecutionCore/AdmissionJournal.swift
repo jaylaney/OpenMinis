@@ -9,9 +9,10 @@ final class AdmissionJournal {
     var epoch: StorageEpoch { status.epoch }
     var recoveryRequired: Bool { status.recoveryRequired }
 
-    init(directory: URL) throws {
+    init(directory: URL, controllerID: ControllerID) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        database = try SQLiteDatabase(url: directory.appendingPathComponent("admission.sqlite3"))
+        let ownershipLock = try JournalDirectoryLock(directory: directory)
+        database = try SQLiteDatabase(url: directory.appendingPathComponent("admission.sqlite3"), ownershipLock: ownershipLock)
         // A temporary initialization value is replaced by persisted state before init returns.
         status = AdmissionStatus(epoch: StorageEpoch(), recoveryRequired: false, activeRun: nil)
         try database.transaction {
@@ -48,37 +49,32 @@ final class AdmissionJournal {
                 )
                 """)
             try database.execute("INSERT OR IGNORE INTO journal(singleton, epoch, recovery) VALUES(1, ?, 0)", [.text(StorageEpoch().rawValue.uuidString)])
+            try validateController(controllerID)
             // Opening unresolved work conservatively requires host-confirmed absence.
             try database.execute("UPDATE journal SET recovery = 1 WHERE EXISTS(SELECT 1 FROM runs WHERE state != 'settled')")
             status = try readStatus()
         }
     }
 
-    /// Persist the configured controller even before the first request arrives.
-    func bindController(_ controllerID: ControllerID) throws {
-        try update { try validateController(controllerID) }
-    }
-
     func runStatus(for runID: RunID) throws -> RunRecord? {
         try database.query("SELECT session_id, run_id, state, outcome FROM runs WHERE run_id = ?", [.text(runID.rawValue.uuidString)]).first.map(decodeRun)
     }
 
-    func record(_ request: MutationRequest) throws -> RequestRecord {
+    func record(_ request: MutationRequest) throws -> SubmissionResult {
         try update {
             guard request.epoch == (try readStatus().epoch) else { throw AdmissionError.staleEpoch }
             try validateController(request.controllerID)
             let digest = fingerprint(request)
             if let existing = try lookup(request.requestID) {
-                if existing.disposition == .rejectedAbsent { return existing }
+                if existing.disposition == .rejectedAbsent { return SubmissionResult(record: existing, isReplay: true) }
                 guard existing.digest == digest else { throw AdmissionError.payloadConflict }
-                return existing
+                return SubmissionResult(record: existing, isReplay: true)
             }
             let current = try readStatus()
-            if current.recoveryRequired && request.kind == .startRun { throw AdmissionError.recoveryRequired }
             let disposition: RequestDisposition
             switch request.kind {
             case .startRun:
-                if current.activeRun != nil {
+                if current.recoveryRequired || current.activeRun != nil {
                     disposition = .rejectedBusy
                 } else if try runStatus(for: request.runID) != nil {
                     disposition = .rejectedRunUnavailable
@@ -100,7 +96,7 @@ final class AdmissionJournal {
                 requestID: request.requestID, sessionID: request.sessionID, runID: request.runID,
                 kind: request.kind, digest: digest, disposition: disposition)
             try insert(record)
-            return record
+            return SubmissionResult(record: record, isReplay: false)
         }
     }
 

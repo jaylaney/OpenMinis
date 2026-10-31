@@ -10,10 +10,33 @@ enum SQLiteValue {
     case text(String), null
 }
 
-final class SQLiteDatabase {
-    private let connection: OpaquePointer
+/// Holds ownership until after SQLite closes, including failed database initialization.
+private final class SQLiteConnection {
+    let pointer: OpaquePointer
+    private let ownershipLock: JournalDirectoryLock?
 
-    init(url: URL) throws {
+    init(pointer: OpaquePointer, ownershipLock: JournalDirectoryLock?) {
+        self.pointer = pointer
+        self.ownershipLock = ownershipLock
+    }
+
+    deinit {
+        _ = withExtendedLifetime(ownershipLock) { sqlite3_close_v2(pointer) }
+    }
+}
+
+struct JournalTransactionError: Error {
+    let originalError: any Error
+    let rollbackError: any Error
+}
+
+final class SQLiteDatabase {
+    private let handle: SQLiteConnection
+    private var connection: OpaquePointer { handle.pointer }
+
+    init(url: URL, ownershipLock: JournalDirectoryLock? = nil) throws {
+        // Cover open failure cleanup as well as successful transfer to the connection.
+        defer { withExtendedLifetime(ownershipLock) {} }
         var opened: OpaquePointer?
         let result = sqlite3_open_v2(url.path, &opened, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nil)
         guard result == SQLITE_OK, let opened else {
@@ -21,19 +44,12 @@ final class SQLiteDatabase {
             if let opened { sqlite3_close_v2(opened) }
             throw JournalStorageError(message: message)
         }
-        connection = opened
-        do {
-            try execute("PRAGMA foreign_keys = ON")
-            try execute("PRAGMA journal_mode = DELETE")
-            try execute("PRAGMA synchronous = FULL")
-            try execute("PRAGMA fullfsync = ON")
-        } catch {
-            // The initialized connection is closed by deinit if initialization throws.
-            throw error
-        }
+        handle = SQLiteConnection(pointer: opened, ownershipLock: ownershipLock)
+        try execute("PRAGMA foreign_keys = ON")
+        try execute("PRAGMA journal_mode = DELETE")
+        try execute("PRAGMA synchronous = FULL")
+        try execute("PRAGMA fullfsync = ON")
     }
-
-    deinit { sqlite3_close_v2(connection) }
 
     func execute(_ sql: String, _ values: [SQLiteValue] = []) throws {
         _ = try query(sql, values)
@@ -78,9 +94,16 @@ final class SQLiteDatabase {
             try execute("COMMIT")
             return value
         } catch {
-            // A rollback failure is also a storage failure and must not be silently discarded.
-            try execute("ROLLBACK")
-            throw error
+            let originalError = error
+            // SQLITE_FULL and other failures can already have rolled back the transaction.
+            if sqlite3_get_autocommit(connection) == 0 {
+                do {
+                    try execute("ROLLBACK")
+                } catch {
+                    throw JournalTransactionError(originalError: originalError, rollbackError: error)
+                }
+            }
+            throw originalError
         }
     }
 

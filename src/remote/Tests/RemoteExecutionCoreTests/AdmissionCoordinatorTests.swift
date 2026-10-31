@@ -69,7 +69,7 @@ final class AdmissionCoordinatorTests: XCTestCase {
             let status = await coordinator.status()
             XCTAssertNil(status.activeRun)
             let admitted = try await coordinator.submit(mutation, over: replacement)
-            XCTAssertEqual(admitted.disposition, .admitted)
+            XCTAssertEqual(admitted.record.disposition, .admitted)
         }
     }
 
@@ -93,7 +93,8 @@ final class AdmissionCoordinatorTests: XCTestCase {
             await gate.release()
             await assertError(.staleConnection) { _ = try await delayed.value }
             let retry = try await coordinator.submit(mutation, over: current)
-            XCTAssertEqual(retry, absent)
+            XCTAssertEqual(retry.record, absent)
+            XCTAssertTrue(retry.isReplay)
             let status = await coordinator.status()
             XCTAssertNil(status.activeRun)
         }
@@ -109,12 +110,14 @@ final class AdmissionCoordinatorTests: XCTestCase {
             let absent = try await coordinator!.reconcile(requestID: mutation.requestID, epoch: mutation.epoch, over: lease)
             let reconnected = try await coordinator!.connect(controllerID: controller)
             let retry = try await coordinator!.submit(mutation, over: reconnected)
-            XCTAssertEqual(retry, absent)
+            XCTAssertEqual(retry.record, absent)
+            XCTAssertTrue(retry.isReplay)
             coordinator = nil
             let reopened = try AdmissionCoordinator(directory: directory, controllerID: controller)
             let freshLease = try await reopened.connect(controllerID: controller)
             let persisted = try await reopened.submit(mutation, over: freshLease)
-            XCTAssertEqual(persisted, absent)
+            XCTAssertEqual(persisted.record, absent)
+            XCTAssertTrue(persisted.isReplay)
             let lookup = try await reopened.reconcile(requestID: mutation.requestID, epoch: mutation.epoch, over: freshLease)
             XCTAssertEqual(lookup, absent)
             let status = await reopened.status()
@@ -135,7 +138,7 @@ final class AdmissionCoordinatorTests: XCTestCase {
             await assertError(.wrongController) { _ = try await coordinator.submit(foreignMutation, over: valid) }
             let authorized = request(epoch, controller: controller, id: foreignMutation.requestID)
             let admitted = try await coordinator.submit(authorized, over: valid)
-            XCTAssertEqual(admitted.disposition, .admitted)
+            XCTAssertEqual(admitted.record.disposition, .admitted)
             let foreignCoordinator = try AdmissionCoordinator(directory: directory.appendingPathComponent("other"), controllerID: foreign)
             let foreignLease = try await foreignCoordinator.connect(controllerID: foreign)
             let unknown = RequestID()
@@ -145,7 +148,7 @@ final class AdmissionCoordinatorTests: XCTestCase {
             let stop = request(epoch, controller: controller, id: unknown, session: authorized.sessionID,
                                run: authorized.runID, kind: .stopRun)
             let stopped = try await coordinator.submit(stop, over: valid)
-            XCTAssertEqual(stopped.disposition, .stopRequested)
+            XCTAssertEqual(stopped.record.disposition, .stopRequested)
         }
     }
 
@@ -164,7 +167,7 @@ final class AdmissionCoordinatorTests: XCTestCase {
             XCTAssertEqual(status.epoch, epoch)
             let lease = try await reopened.connect(controllerID: controller)
             let accepted = try await reopened.submit(request(epoch, controller: controller), over: lease)
-            XCTAssertEqual(accepted.disposition, .admitted)
+            XCTAssertEqual(accepted.record.disposition, .admitted)
         }
     }
 
@@ -182,7 +185,7 @@ final class AdmissionCoordinatorTests: XCTestCase {
             let epoch = await coordinator.status().epoch
             let current = request(epoch, controller: controller, id: old.requestID)
             let accepted = try await coordinator.submit(current, over: lease)
-            XCTAssertEqual(accepted.disposition, .admitted)
+            XCTAssertEqual(accepted.record.disposition, .admitted)
         }
     }
 
@@ -195,23 +198,23 @@ final class AdmissionCoordinatorTests: XCTestCase {
             let epoch = await coordinator.status().epoch
             let first = request(epoch, controller: controller)
             let admitted = try await coordinator.submit(first, over: lease)
-            XCTAssertEqual(admitted.disposition, .admitted)
+            XCTAssertEqual(admitted.record.disposition, .admitted)
             let reconciled = try await coordinator.reconcile(requestID: first.requestID, epoch: epoch, over: lease)
-            XCTAssertEqual(reconciled, admitted)
+            XCTAssertEqual(reconciled, admitted.record)
             let stop = request(epoch, controller: controller, session: first.sessionID, run: first.runID, kind: .stopRun)
             let stopRecord = try await coordinator.submit(stop, over: lease)
-            XCTAssertEqual(stopRecord.disposition, .stopRequested)
+            XCTAssertEqual(stopRecord.record.disposition, .stopRequested)
             let pending = try await coordinator.runStatus(for: first.runID)
             XCTAssertEqual(pending?.state, .stopRequested)
             XCTAssertNil(pending?.outcome)
             let busy = try await coordinator.submit(request(epoch, controller: controller), over: lease)
-            XCTAssertEqual(busy.disposition, .rejectedBusy)
+            XCTAssertEqual(busy.record.disposition, .rejectedBusy)
             try await coordinator.settle(runID: first.runID, epoch: first.epoch, outcome: .completed)
             let later = request(epoch, controller: controller, session: first.sessionID)
             _ = try await coordinator.submit(later, over: lease)
             let lateStop = request(epoch, controller: controller, session: first.sessionID, run: first.runID, kind: .stopRun)
             let rejected = try await coordinator.submit(lateStop, over: lease)
-            XCTAssertEqual(rejected.disposition, .rejectedRunUnavailable)
+            XCTAssertEqual(rejected.record.disposition, .rejectedRunUnavailable)
             let status = await coordinator.status()
             XCTAssertEqual(status.activeRun?.runID, later.runID)
             XCTAssertEqual(status.activeRun?.state, .active)
@@ -228,7 +231,7 @@ final class AdmissionCoordinatorTests: XCTestCase {
             let lease = try await coordinator.connect(controllerID: controller)
             let first = request(await coordinator.status().epoch, controller: controller)
             let admitted = try await coordinator.submit(first, over: lease)
-            XCTAssertEqual(admitted.disposition, .admitted)
+            XCTAssertEqual(admitted.record.disposition, .admitted)
             _ = try await coordinator.connect(controllerID: controller)
             try await coordinator.settle(runID: first.runID, epoch: first.epoch, outcome: .completed)
             let nextEpoch = try await coordinator.reset()
@@ -236,7 +239,7 @@ final class AdmissionCoordinatorTests: XCTestCase {
             let current = try await coordinator.connect(controllerID: controller)
             let reused = request(nextEpoch, controller: controller, run: first.runID)
             let readmitted = try await coordinator.submit(reused, over: current)
-            XCTAssertEqual(readmitted.disposition, .admitted)
+            XCTAssertEqual(readmitted.record.disposition, .admitted)
 
             await assertError(.staleEpoch) {
                 try await coordinator.settle(runID: first.runID, epoch: first.epoch, outcome: .completed)
@@ -248,7 +251,7 @@ final class AdmissionCoordinatorTests: XCTestCase {
             let status = await coordinator.status()
             XCTAssertEqual(status.activeRun, stillActive)
             let busy = try await coordinator.submit(request(nextEpoch, controller: controller), over: current)
-            XCTAssertEqual(busy.disposition, .rejectedBusy)
+            XCTAssertEqual(busy.record.disposition, .rejectedBusy)
 
             try await coordinator.settle(runID: reused.runID, epoch: reused.epoch, outcome: .completed)
             let settled = try await coordinator.runStatus(for: reused.runID)
@@ -273,12 +276,13 @@ final class AdmissionCoordinatorTests: XCTestCase {
             XCTAssertTrue(recoveredStatus.recoveryRequired)
             let next = request(mutation.epoch, controller: controller)
             await assertError(.staleConnection) { _ = try await reopened.submit(next, over: originalLease) }
-            await assertError(.recoveryRequired) { _ = try await reopened.submit(next, over: recoveryLease) }
+            let refused = try await reopened.submit(next, over: recoveryLease)
+            XCTAssertEqual(refused.record.disposition, .rejectedBusy)
             await assertError(.recoveryRequired) { _ = try await reopened.reset() }
             let recoveryStop = request(mutation.epoch, controller: controller, session: mutation.sessionID,
                                        run: mutation.runID, kind: .stopRun)
             let stop = try await reopened.submit(recoveryStop, over: recoveryLease)
-            XCTAssertEqual(stop.disposition, .stopRequested)
+            XCTAssertEqual(stop.record.disposition, .stopRequested)
             try await reopened.confirmRecoveredProcessesAbsent()
             await assertError(.staleConnection) { _ = try await reopened.submit(next, over: recoveryLease) }
             let afterRecovery = try await reopened.connect(controllerID: controller)
@@ -293,7 +297,112 @@ final class AdmissionCoordinatorTests: XCTestCase {
             await assertError(.staleEpoch) { _ = try await reopened.submit(next, over: afterReset) }
             let fresh = request(newEpoch, controller: controller, id: next.requestID)
             let accepted = try await reopened.submit(fresh, over: afterReset)
-            XCTAssertEqual(accepted.disposition, .admitted)
+            XCTAssertEqual(accepted.record.disposition, .admitted)
+        }
+    }
+
+    // A no-op absence confirmation must preserve both idle and live connection authority.
+    func testNoOpRecoveryPreservesLease() async throws {
+        try await fixture { directory in
+            let controller = ControllerID()
+            let coordinator = try AdmissionCoordinator(directory: directory, controllerID: controller)
+            let lease = try await coordinator.connect(controllerID: controller)
+            let start = request(await coordinator.status().epoch, controller: controller)
+            try await coordinator.confirmRecoveredProcessesAbsent()
+            _ = try await coordinator.submit(start, over: lease)
+            try await coordinator.confirmRecoveredProcessesAbsent()
+            let stop = request(start.epoch, controller: controller, session: start.sessionID,
+                               run: start.runID, kind: .stopRun)
+            let result = try await coordinator.submit(stop, over: lease)
+            XCTAssertEqual(result.record.disposition, .stopRequested)
+        }
+    }
+
+    // A second connection owner must fail before touching live state or channel authority.
+    func testConcurrentOwnersAreRejectedWithoutDisturbingLease() async throws {
+        try await fixture { directory in
+            let controller = ControllerID()
+            var owner: AdmissionCoordinator? = try AdmissionCoordinator(directory: directory, controllerID: controller)
+            let lease = try await owner!.connect(controllerID: controller)
+            let start = request(await owner!.status().epoch, controller: controller)
+            _ = try await owner!.submit(start, over: lease)
+            for candidate in [controller, ControllerID()] {
+                XCTAssertThrowsError(try AdmissionCoordinator(directory: directory, controllerID: candidate)) {
+                    XCTAssertTrue($0 is JournalStorageError)
+                    XCTAssertTrue(String(describing: $0).contains("already owned"))
+                }
+            }
+            let stop = request(start.epoch, controller: controller, session: start.sessionID,
+                               run: start.runID, kind: .stopRun)
+            _ = try await owner!.submit(stop, over: lease)
+            try await owner!.settle(runID: start.runID, epoch: start.epoch, outcome: .completed)
+            owner = nil
+            let reopened = try AdmissionCoordinator(directory: directory, controllerID: controller)
+            let status = await reopened.status()
+            XCTAssertEqual(status.epoch, start.epoch)
+            XCTAssertFalse(status.recoveryRequired)
+            let settled = try await reopened.runStatus(for: start.runID)
+            XCTAssertEqual(settled?.outcome, .completed)
+        }
+    }
+
+    // Rejecting a wrong configured controller must leave recovery untouched, and release ownership.
+    func testFailedControllerInitializationDoesNotMutateRecovery() async throws {
+        try await fixture { directory in
+            let controller = ControllerID()
+            var owner: AdmissionCoordinator? = try AdmissionCoordinator(directory: directory, controllerID: controller)
+            let lease = try await owner!.connect(controllerID: controller)
+            let start = request(await owner!.status().epoch, controller: controller)
+            _ = try await owner!.submit(start, over: lease)
+            owner = nil
+            func recoveryValue() throws -> String? {
+                let raw = try SQLiteDatabase(url: directory.appendingPathComponent("admission.sqlite3"))
+                return try raw.query("SELECT recovery FROM journal").first?[0]
+            }
+            XCTAssertEqual(try recoveryValue(), "0")
+            XCTAssertThrowsError(try AdmissionCoordinator(directory: directory, controllerID: ControllerID())) {
+                XCTAssertEqual($0 as? AdmissionError, .wrongController)
+            }
+            XCTAssertEqual(try recoveryValue(), "0")
+            let reopened = try AdmissionCoordinator(directory: directory, controllerID: controller)
+            let status = await reopened.status()
+            XCTAssertEqual(status.epoch, start.epoch)
+            XCTAssertTrue(status.recoveryRequired)
+            XCTAssertEqual(status.activeRun?.runID, start.runID)
+        }
+    }
+
+    // Only the first insertion is a new admission; reconnect/reopen never reauthorizes launch.
+    func testSubmissionMarksAdmittedAndAbsentReplays() async throws {
+        try await fixture { directory in
+            let controller = ControllerID()
+            var owner: AdmissionCoordinator? = try AdmissionCoordinator(directory: directory, controllerID: controller)
+            let lease = try await owner!.connect(controllerID: controller)
+            let start = request(await owner!.status().epoch, controller: controller)
+            let first = try await owner!.submit(start, over: lease)
+            XCTAssertFalse(first.isReplay)
+            XCTAssertEqual(first.record.disposition, .admitted)
+            let duplicate = try await owner!.submit(start, over: lease)
+            XCTAssertTrue(duplicate.isReplay)
+            XCTAssertEqual(duplicate.record, first.record)
+            let replacement = try await owner!.connect(controllerID: controller)
+            let reconnected = try await owner!.submit(start, over: replacement)
+            XCTAssertTrue(reconnected.isReplay)
+            XCTAssertEqual(reconnected.record, first.record)
+            let absent = request(start.epoch, controller: controller)
+            let tombstone = try await owner!.reconcile(requestID: absent.requestID, epoch: absent.epoch, over: replacement)
+            let refused = try await owner!.submit(absent, over: replacement)
+            XCTAssertTrue(refused.isReplay)
+            XCTAssertEqual(refused.record, tombstone)
+            owner = nil
+            let reopened = try AdmissionCoordinator(directory: directory, controllerID: controller)
+            let current = try await reopened.connect(controllerID: controller)
+            let persisted = try await reopened.submit(start, over: current)
+            XCTAssertTrue(persisted.isReplay)
+            XCTAssertEqual(persisted.record, first.record)
+            let persistedAbsent = try await reopened.submit(absent, over: current)
+            XCTAssertTrue(persistedAbsent.isReplay)
+            XCTAssertEqual(persistedAbsent.record, tombstone)
         }
     }
 }

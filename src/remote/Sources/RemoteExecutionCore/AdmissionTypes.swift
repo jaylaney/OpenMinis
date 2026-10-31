@@ -64,6 +64,13 @@ public struct RequestRecord: Codable, Equatable, Sendable {
     public let disposition: RequestDisposition
 }
 
+/// Whether this call inserted the durable decision or returned an existing one.
+/// A new admission is not proof of process launch or durable execution ownership.
+public struct SubmissionResult: Equatable, Sendable {
+    public let record: RequestRecord
+    public let isReplay: Bool
+}
+
 public enum RunOutcome: String, Codable, Sendable { case completed, failed, interruptedUnknown }
 public enum RunState: String, Codable, Sendable { case active, stopRequested, settled }
 

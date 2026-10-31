@@ -17,11 +17,14 @@ network peers, user databases or OS processes.
 ## Admission and status
 
 Create one `AdmissionCoordinator(directory:controllerID:)` per journal directory,
-with exclusive ownership for its lifetime. Initialization durably binds the
-configured controller, even before any requests, and rejects a different binding
-on reopen. The synchronous journal is internal to the package, confined to that
-coordinator. Sharing a directory between live coordinators or processes is not a
-supported host topology.
+with exclusive ownership for its lifetime. A nonblocking exclusive OS lock on the
+stable `admission.lock` file is acquired before opening SQLite and retained until
+the connection closes, including initialization failures. Concurrent owners fail
+with a storage error before changing journal state. Never unlink or replace the
+lock file while a journal owner may exist. Initialization validates/binds the
+configured controller in the same transaction before changing recovery state;
+a wrong controller leaves persisted state untouched. The synchronous journal is
+internal to the package, confined to that coordinator.
 
 `connect(controllerID:)` returns an opaque `ConnectionLease` with no public
 initializer. Replacing the connection invalidates the old lease. A rejected
@@ -31,8 +34,17 @@ journal transactions, without an actor suspension between validation and commit.
 
 Each request ID has one durable disposition for its storage epoch. Matching
 retries return that record; changed identity, metadata or payload conflicts are
-rejected. An unknown-ID `reconcile(requestID:epoch:over:)` writes `rejectedAbsent`
-before returning. This tombstone refuses all later content for that ID, including
+rejected. `submit(_:over:)` returns `SubmissionResult(record:isReplay:)`:
+`isReplay` is false only for a newly inserted decision and true for every existing
+record, including an absence tombstone. Reconciliation still returns a
+`RequestRecord`. Only `!result.isReplay && result.record.disposition == .admitted`
+signals a new Start admission. An existing admitted record, including after
+reopen, never authorizes another launch. This return marker is not a durable
+process-execution claim: the host still needs its separately qualified durable
+intent, launch and recovery protocol before executing processes.
+
+An unknown-ID `reconcile(requestID:epoch:over:)` writes `rejectedAbsent` before
+returning. This tombstone refuses all later content for that ID, including
 delayed sends on a replacement connection and after reopening storage. Busy
 rejections also remain terminal. A reset creates a new namespace, so IDs may be
 used anew only with its new epoch.
@@ -43,13 +55,21 @@ a command started, terminated or succeeded. Stop keeps the active slot occupied.
 `status()` reports the epoch, recovery requirement and unresolved active run;
 `runStatus(for:)` reports run state and any settled outcome. Only explicit host
 settlement releases an active slot during normal operation. Late Stop requests
-for another run cannot change the current run.
+for another run cannot change the current run. Automatic Stop retry must never
+resurrect a tombstoned or otherwise terminally refused ID. After a definitive
+`rejectedAbsent` or other terminal refusal, first check that the same target still
+needs Stop, then use a new Stop ID with the same epoch/session/run. A changed
+epoch never silently retargets an old Stop. Receipt of `stopRequested` does not
+prove termination.
 
-Reopening unresolved work sets `recoveryRequired`: new Start admissions are
-blocked, while matching run-scoped Stop remains available. The host must verify
+Reopening unresolved work sets `recoveryRequired`: new Start requests receive
+terminal `rejectedBusy` decisions, while matching run-scoped Stop
+remains available. Reusing a refused ID stays rejected after recovery; an
+explicit later Send needs a new ID. The host must verify
 that recovered processes are absent before calling
 `confirmRecoveredProcessesAbsent()`. That call records `interruptedUnknown` for
-unresolved work and invalidates previous leases. `reset()` requires no active or
+unresolved work and invalidates previous leases only if recovery actually changed.
+A no-op confirmation preserves the current lease. `reset()` requires no active or
 recovery-blocked work, preserves controller binding, creates a fresh storage
 epoch and invalidates previous leases. Old-epoch submissions, reconciliations
 and settlements are refused. Lost storage likewise creates a new epoch.
@@ -72,6 +92,24 @@ completion is rejected inside the journal transaction before any target-run
 lookup or mutation, including when a new-epoch run reuses the same run ID.
 Matching same-epoch duplicate settlements remain idempotent; contradictory
 outcomes are rejected.
+
+Before exposing any Start, the host must reconcile previously managed processes
+and prove absence or keep admission blocked outside this core. This startup duty
+also applies to fresh, lost or empty storage when `recoveryRequired` is false:
+a new epoch and an empty journal cannot prove that no process survived.
+
+Before service begins, the host must mark its state directory excluded from
+backup and verify that policy. This package does not set that filesystem
+attribute. Restore exclusion and fresh-epoch behavior still require native
+qualification; backup restoration cannot be treated as already safe.
+
+Pre-production host gates also include local controller replacement/revocation
+that blocks admission, invalidates authority and cancels owned work; explicit
+per-run controller ownership; and schema version/migration planning. This package
+has a persistent single-controller binding, not an enrollment/revocation API or
+a schema migration. Deleting the database is not a controller replacement
+procedure. Its synchronous SQLite work also needs dedicated-executor performance
+qualification before host integration; no dedicated executor is implemented here.
 
 Native TLS and authenticated transport, Tailscale integration, enrollment/key
 management, process supervision, UI and notifications remain later gate 1 work.

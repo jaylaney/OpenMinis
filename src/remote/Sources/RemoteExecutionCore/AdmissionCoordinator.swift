@@ -9,8 +9,7 @@ public actor AdmissionCoordinator {
     private var currentToken: UUID?
 
     public init(directory: URL, controllerID: ControllerID) throws {
-        let journal = try AdmissionJournal(directory: directory)
-        try journal.bindController(controllerID)
+        let journal = try AdmissionJournal(directory: directory, controllerID: controllerID)
         self.journal = journal
         self.controllerID = controllerID
     }
@@ -23,7 +22,7 @@ public actor AdmissionCoordinator {
         return ConnectionLease(token: token, controllerID: controllerID)
     }
 
-    public func submit(_ request: MutationRequest, over lease: ConnectionLease) throws -> RequestRecord {
+    public func submit(_ request: MutationRequest, over lease: ConnectionLease) throws -> SubmissionResult {
         guard request.controllerID == controllerID else { throw AdmissionError.wrongController }
         try validate(lease, epoch: request.epoch)
         // No suspension between capability/epoch validation and the durable transaction.
@@ -51,10 +50,11 @@ public actor AdmissionCoordinator {
     }
 
     /// Host-internal: the caller must independently verify recovered processes are absent.
-    /// Successful recovery confirmation also invalidates every previously issued lease.
+    /// A changed recovery state also invalidates every previously issued lease.
     public func confirmRecoveredProcessesAbsent() throws {
+        let wasRecovering = journal.recoveryRequired
         try journal.confirmRecoveredProcessesAbsent()
-        currentToken = nil
+        if wasRecovering { currentToken = nil }
     }
 
     /// Host-internal: succeeds only without active or recovery-blocked work.

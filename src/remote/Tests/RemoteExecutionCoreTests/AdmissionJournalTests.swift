@@ -3,6 +3,7 @@ import XCTest
 @testable import RemoteExecutionCore
 
 final class AdmissionJournalTests: XCTestCase {
+    private let controller = ControllerID()
     private func fixture(_ body: (URL) throws -> Void) throws {
         let directory = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("remote-journal-tests-\(UUID().uuidString)")
@@ -10,11 +11,11 @@ final class AdmissionJournalTests: XCTestCase {
         try body(directory)
     }
 
-    private func request(_ epoch: StorageEpoch, controller: ControllerID = ControllerID(),
+    private func request(_ epoch: StorageEpoch, controller: ControllerID? = nil,
                          id: RequestID = RequestID(), session: SessionID = SessionID(),
                          run: RunID = RunID(), kind: MutationKind = .startRun,
                          payload: Data = Data([0, 1, 255])) -> MutationRequest {
-        MutationRequest(epoch: epoch, controllerID: controller, requestID: id,
+        MutationRequest(epoch: epoch, controllerID: controller ?? self.controller, requestID: id,
                         sessionID: session, runID: run, kind: kind, payload: payload)
     }
 
@@ -29,17 +30,20 @@ final class AdmissionJournalTests: XCTestCase {
     // Catches loss of accepted IDs, metadata, or fingerprints across an actual close/reopen.
     func testAcceptedRequestSurvivesReopen() throws {
         try fixture { directory in
-            var journal: AdmissionJournal? = try AdmissionJournal(directory: directory)
+            var journal: AdmissionJournal? = try AdmissionJournal(directory: directory, controllerID: controller)
             let mutation = request(journal!.epoch)
-            let accepted = try journal!.record(mutation)
+            let submission = try journal!.record(mutation)
+            XCTAssertFalse(submission.isReplay)
+            let accepted = submission.record
             XCTAssertEqual(accepted.disposition, .admitted)
+            XCTAssertTrue(try journal!.record(mutation).isReplay)
             XCTAssertEqual(accepted.sessionID, mutation.sessionID)
             XCTAssertEqual(accepted.runID, mutation.runID)
             XCTAssertNotNil(accepted.digest)
             journal = nil
-            let reopened = try AdmissionJournal(directory: directory)
+            let reopened = try AdmissionJournal(directory: directory, controllerID: controller)
             XCTAssertEqual(reopened.epoch, mutation.epoch)
-            XCTAssertEqual(try reopened.record(mutation), accepted)
+            XCTAssertEqual(try reopened.record(mutation).record, accepted)
             XCTAssertEqual(try reopened.lookupOrRejectAbsent(mutation.requestID, controllerID: mutation.controllerID), accepted)
         }
     }
@@ -47,11 +51,11 @@ final class AdmissionJournalTests: XCTestCase {
     // Catches fingerprints omitting any identity field or payload, including after persistence.
     func testChangedPayloadOrMetadataConflicts() throws {
         try fixture { directory in
-            var journal: AdmissionJournal? = try AdmissionJournal(directory: directory)
+            var journal: AdmissionJournal? = try AdmissionJournal(directory: directory, controllerID: controller)
             let original = request(journal!.epoch)
             _ = try journal!.record(original)
             journal = nil
-            let reopened = try AdmissionJournal(directory: directory)
+            let reopened = try AdmissionJournal(directory: directory, controllerID: controller)
             let variants = [
                 request(original.epoch, controller: original.controllerID, id: original.requestID, session: original.sessionID, run: original.runID, payload: Data([9])),
                 request(original.epoch, controller: original.controllerID, id: original.requestID, session: SessionID(), run: original.runID),
@@ -62,7 +66,7 @@ final class AdmissionJournalTests: XCTestCase {
                 assertAdmissionError(.payloadConflict) { _ = try reopened.record(variant) }
             }
             assertAdmissionError(.wrongController) {
-                _ = try reopened.record(request(original.epoch, id: original.requestID))
+                _ = try reopened.record(request(original.epoch, controller: ControllerID(), id: original.requestID))
             }
         }
     }
@@ -70,16 +74,16 @@ final class AdmissionJournalTests: XCTestCase {
     // Catches busy rejections being recomputed when the active slot becomes available.
     func testBusyRejectionSurvivesIdleAndReopen() throws {
         try fixture { directory in
-            var journal: AdmissionJournal? = try AdmissionJournal(directory: directory)
+            var journal: AdmissionJournal? = try AdmissionJournal(directory: directory, controllerID: controller)
             let first = request(journal!.epoch)
             let busy = request(journal!.epoch, controller: first.controllerID)
             _ = try journal!.record(first)
-            XCTAssertEqual(try journal!.record(busy).disposition, .rejectedBusy)
+            XCTAssertEqual(try journal!.record(busy).record.disposition, .rejectedBusy)
             try journal!.settle(runID: first.runID, epoch: first.epoch, outcome: .completed)
-            XCTAssertEqual(try journal!.record(busy).disposition, .rejectedBusy)
+            XCTAssertEqual(try journal!.record(busy).record.disposition, .rejectedBusy)
             journal = nil
-            let reopened = try AdmissionJournal(directory: directory)
-            XCTAssertEqual(try reopened.record(busy).disposition, .rejectedBusy)
+            let reopened = try AdmissionJournal(directory: directory, controllerID: controller)
+            XCTAssertEqual(try reopened.record(busy).record.disposition, .rejectedBusy)
             XCTAssertNil(try reopened.runStatus(for: busy.runID))
         }
     }
@@ -87,23 +91,23 @@ final class AdmissionJournalTests: XCTestCase {
     // Catches Stop releasing the slot or selecting a later run by session alone.
     func testStopWaitsForSettlementAndDoesNotStopLaterRun() throws {
         try fixture { directory in
-            let journal = try AdmissionJournal(directory: directory)
+            let journal = try AdmissionJournal(directory: directory, controllerID: controller)
             let first = request(journal.epoch)
             _ = try journal.record(first)
             let stop = request(journal.epoch, controller: first.controllerID, session: first.sessionID, run: first.runID, kind: .stopRun)
-            XCTAssertEqual(try journal.record(stop).disposition, .stopRequested)
+            XCTAssertEqual(try journal.record(stop).record.disposition, .stopRequested)
             XCTAssertEqual(journal.status.activeRun?.state, .stopRequested)
             XCTAssertNil(journal.status.activeRun?.outcome)
-            XCTAssertEqual(try journal.record(request(journal.epoch, controller: first.controllerID)).disposition, .rejectedBusy)
+            XCTAssertEqual(try journal.record(request(journal.epoch, controller: first.controllerID)).record.disposition, .rejectedBusy)
             assertAdmissionError(.invalidTransition) { _ = try journal.reset() }
             try journal.settle(runID: first.runID, epoch: first.epoch, outcome: .completed)
             try journal.settle(runID: first.runID, epoch: first.epoch, outcome: .completed)
             assertAdmissionError(.invalidTransition) { try journal.settle(runID: first.runID, epoch: first.epoch, outcome: .failed) }
             let later = request(journal.epoch, controller: first.controllerID, session: first.sessionID)
-            XCTAssertEqual(try journal.record(later).disposition, .admitted)
-            XCTAssertEqual(try journal.record(stop).disposition, .stopRequested)
+            XCTAssertEqual(try journal.record(later).record.disposition, .admitted)
+            XCTAssertEqual(try journal.record(stop).record.disposition, .stopRequested)
             let lateStop = request(journal.epoch, controller: first.controllerID, session: first.sessionID, run: first.runID, kind: .stopRun)
-            XCTAssertEqual(try journal.record(lateStop).disposition, .rejectedRunUnavailable)
+            XCTAssertEqual(try journal.record(lateStop).record.disposition, .rejectedRunUnavailable)
             XCTAssertEqual(journal.status.activeRun?.runID, later.runID)
             XCTAssertEqual(journal.status.activeRun?.state, .active)
             XCTAssertEqual(try journal.runStatus(for: first.runID)?.outcome, .completed)
@@ -113,18 +117,18 @@ final class AdmissionJournalTests: XCTestCase {
     // Catches restart silently accepting new work without host-confirmed process absence.
     func testReopenWithActiveRunRequiresRecovery() throws {
         try fixture { directory in
-            var journal: AdmissionJournal? = try AdmissionJournal(directory: directory)
+            var journal: AdmissionJournal? = try AdmissionJournal(directory: directory, controllerID: controller)
             let first = request(journal!.epoch)
             _ = try journal!.record(first)
             journal = nil
-            let reopened = try AdmissionJournal(directory: directory)
+            let reopened = try AdmissionJournal(directory: directory, controllerID: controller)
             XCTAssertTrue(reopened.recoveryRequired)
             XCTAssertTrue(reopened.status.recoveryRequired)
             let next = request(reopened.epoch, controller: first.controllerID)
-            assertAdmissionError(.recoveryRequired) { _ = try reopened.record(next) }
+            XCTAssertEqual(try reopened.record(next).record.disposition, .rejectedBusy)
             assertAdmissionError(.recoveryRequired) { _ = try reopened.reset() }
             let recoveryStop = request(reopened.epoch, controller: first.controllerID, session: first.sessionID, run: first.runID, kind: .stopRun)
-            XCTAssertEqual(try reopened.record(recoveryStop).disposition, .stopRequested)
+            XCTAssertEqual(try reopened.record(recoveryStop).record.disposition, .stopRequested)
             XCTAssertTrue(reopened.recoveryRequired)
             XCTAssertEqual(reopened.status.activeRun?.state, .stopRequested)
             assertAdmissionError(.wrongController) {
@@ -133,20 +137,21 @@ final class AdmissionJournalTests: XCTestCase {
             try reopened.confirmRecoveredProcessesAbsent()
             XCTAssertFalse(reopened.recoveryRequired)
             XCTAssertEqual(try reopened.runStatus(for: first.runID)?.outcome, .interruptedUnknown)
-            XCTAssertEqual(try reopened.record(next).disposition, .admitted)
+            XCTAssertEqual(try reopened.record(next).record.disposition, .rejectedBusy)
+            XCTAssertEqual(try reopened.record(request(reopened.epoch, controller: first.controllerID)).record.disposition, .admitted)
         }
     }
 
     // Catches recovery of another run breaking idempotent settlement of a completed run.
     func testRepeatedSettlementRemainsIdempotentWhileAnotherRunNeedsRecovery() throws {
         try fixture { directory in
-            var journal: AdmissionJournal? = try AdmissionJournal(directory: directory)
+            var journal: AdmissionJournal? = try AdmissionJournal(directory: directory, controllerID: controller)
             let first = request(journal!.epoch)
             _ = try journal!.record(first)
             try journal!.settle(runID: first.runID, epoch: first.epoch, outcome: .completed)
             _ = try journal!.record(request(journal!.epoch, controller: first.controllerID))
             journal = nil
-            let reopened = try AdmissionJournal(directory: directory)
+            let reopened = try AdmissionJournal(directory: directory, controllerID: controller)
             XCTAssertTrue(reopened.recoveryRequired)
             try reopened.settle(runID: first.runID, epoch: first.epoch, outcome: .completed)
             assertAdmissionError(.invalidTransition) { try reopened.settle(runID: first.runID, epoch: first.epoch, outcome: .failed) }
@@ -157,7 +162,7 @@ final class AdmissionJournalTests: XCTestCase {
     // Catches an absence result which permits a delayed request to run after idle or reopen.
     func testUnknownRequestBecomesPermanentRejection() throws {
         try fixture { directory in
-            var journal: AdmissionJournal? = try AdmissionJournal(directory: directory)
+            var journal: AdmissionJournal? = try AdmissionJournal(directory: directory, controllerID: controller)
             let mutation = request(journal!.epoch)
             let tombstone = try journal!.lookupOrRejectAbsent(mutation.requestID, controllerID: mutation.controllerID)
             XCTAssertEqual(tombstone.disposition, .rejectedAbsent)
@@ -165,10 +170,10 @@ final class AdmissionJournalTests: XCTestCase {
             XCTAssertNil(tombstone.runID)
             XCTAssertNil(tombstone.kind)
             XCTAssertNil(tombstone.digest)
-            XCTAssertEqual(try journal!.record(mutation), tombstone)
+            XCTAssertEqual(try journal!.record(mutation).record, tombstone)
             journal = nil
-            let reopened = try AdmissionJournal(directory: directory)
-            XCTAssertEqual(try reopened.record(mutation), tombstone)
+            let reopened = try AdmissionJournal(directory: directory, controllerID: controller)
+            XCTAssertEqual(try reopened.record(mutation).record, tombstone)
             XCTAssertNil(reopened.status.activeRun)
         }
     }
@@ -176,14 +181,14 @@ final class AdmissionJournalTests: XCTestCase {
     // Catches a delayed old-epoch completion settling a live run which reused its ID after reset.
     func testOldEpochSettlementCannotSettleReusedRunID() throws {
         try fixture { directory in
-            let journal = try AdmissionJournal(directory: directory)
+            let journal = try AdmissionJournal(directory: directory, controllerID: controller)
             let first = request(journal.epoch)
-            XCTAssertEqual(try journal.record(first).disposition, .admitted)
+            XCTAssertEqual(try journal.record(first).record.disposition, .admitted)
             try journal.settle(runID: first.runID, epoch: first.epoch, outcome: .completed)
             let nextEpoch = try journal.reset()
             XCTAssertNotEqual(nextEpoch, first.epoch)
             let reused = request(nextEpoch, controller: first.controllerID, run: first.runID)
-            XCTAssertEqual(try journal.record(reused).disposition, .admitted)
+            XCTAssertEqual(try journal.record(reused).record.disposition, .admitted)
 
             assertAdmissionError(.staleEpoch) {
                 try journal.settle(runID: first.runID, epoch: first.epoch, outcome: .completed)
@@ -193,7 +198,7 @@ final class AdmissionJournalTests: XCTestCase {
             XCTAssertEqual(stillActive?.state, .active)
             XCTAssertNil(stillActive?.outcome)
             XCTAssertEqual(journal.status.activeRun, stillActive)
-            XCTAssertEqual(try journal.record(request(nextEpoch, controller: first.controllerID)).disposition, .rejectedBusy)
+            XCTAssertEqual(try journal.record(request(nextEpoch, controller: first.controllerID)).record.disposition, .rejectedBusy)
 
             try journal.settle(runID: reused.runID, epoch: reused.epoch, outcome: .completed)
             XCTAssertEqual(try journal.runStatus(for: reused.runID)?.outcome, .completed)
@@ -204,19 +209,86 @@ final class AdmissionJournalTests: XCTestCase {
     // Catches epoch reuse after reset or disk-state loss, permitting replay in a new namespace.
     func testResetAndFreshDirectoryRejectOldEpoch() throws {
         try fixture { directory in
-            let journal = try AdmissionJournal(directory: directory)
+            let journal = try AdmissionJournal(directory: directory, controllerID: controller)
             let old = request(journal.epoch)
             _ = try journal.lookupOrRejectAbsent(old.requestID, controllerID: old.controllerID)
             let nextEpoch = try journal.reset()
             XCTAssertNotEqual(nextEpoch, old.epoch)
             assertAdmissionError(.staleEpoch) { _ = try journal.record(old) }
             let updated = request(nextEpoch, controller: old.controllerID, id: old.requestID)
-            XCTAssertEqual(try journal.record(updated).disposition, .admitted)
+            XCTAssertEqual(try journal.record(updated).record.disposition, .admitted)
             try fixture { freshDirectory in
-                let fresh = try AdmissionJournal(directory: freshDirectory)
+                let fresh = try AdmissionJournal(directory: freshDirectory, controllerID: controller)
                 XCTAssertNotEqual(fresh.epoch, nextEpoch)
                 assertAdmissionError(.staleEpoch) { _ = try fresh.record(updated) }
             }
+        }
+    }
+
+    func testRecoveryRefusalSurvivesRecoveryAndAnotherReopen() throws {
+        try fixture { directory in
+            var journal: AdmissionJournal? = try AdmissionJournal(directory: directory, controllerID: controller)
+            let first = request(journal!.epoch)
+            _ = try journal!.record(first)
+            journal = nil
+            journal = try AdmissionJournal(directory: directory, controllerID: controller)
+            let refused = request(first.epoch)
+            let refusal = try journal!.record(refused)
+            XCTAssertFalse(refusal.isReplay)
+            XCTAssertEqual(refusal.record.disposition, .rejectedBusy)
+            try journal!.confirmRecoveredProcessesAbsent()
+            journal = nil
+            let reopened = try AdmissionJournal(directory: directory, controllerID: controller)
+            let replay = try reopened.record(refused)
+            XCTAssertTrue(replay.isReplay)
+            XCTAssertEqual(replay.record, refusal.record)
+            XCTAssertNil(try reopened.runStatus(for: refused.runID))
+            let newSend = try reopened.record(request(first.epoch))
+            XCTAssertFalse(newSend.isReplay)
+            XCTAssertEqual(newSend.record.disposition, .admitted)
+        }
+    }
+
+    func testTombstonedStopNeedsNewIDForSameTarget() throws {
+        try fixture { directory in
+            let journal = try AdmissionJournal(directory: directory, controllerID: controller)
+            let start = request(journal.epoch)
+            _ = try journal.record(start)
+            let oldStop = request(start.epoch, session: start.sessionID, run: start.runID, kind: .stopRun)
+            _ = try journal.lookupOrRejectAbsent(oldStop.requestID, controllerID: controller)
+            let refused = try journal.record(oldStop)
+            XCTAssertTrue(refused.isReplay)
+            XCTAssertEqual(refused.record.disposition, .rejectedAbsent)
+            XCTAssertEqual(journal.status.activeRun?.state, .active)
+            let retry = request(start.epoch, session: start.sessionID, run: start.runID, kind: .stopRun)
+            let requested = try journal.record(retry)
+            XCTAssertFalse(requested.isReplay)
+            XCTAssertEqual(requested.record.disposition, .stopRequested)
+            XCTAssertEqual(journal.status.activeRun?.state, .stopRequested)
+            XCTAssertNil(journal.status.activeRun?.outcome)
+        }
+    }
+
+    func testFailedSQLiteInitializationReleasesStableLock() throws {
+        try fixture { directory in
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let databaseURL = directory.appendingPathComponent("admission.sqlite3")
+            let lockURL = directory.appendingPathComponent("admission.lock")
+            try Data("invalid SQLite database".utf8).write(to: databaseURL)
+            XCTAssertThrowsError(try AdmissionJournal(directory: directory, controllerID: controller)) {
+                XCTAssertTrue($0 is JournalStorageError)
+            }
+            let inode = try FileManager.default.attributesOfItem(atPath: lockURL.path)[.systemFileNumber] as? NSNumber
+            XCTAssertNotNil(inode)
+            // Repair only the synthetic invalid database, retaining the stable ownership file.
+            try FileManager.default.removeItem(at: databaseURL)
+            var journal: AdmissionJournal? = try AdmissionJournal(directory: directory, controllerID: controller)
+            let epoch = journal!.epoch
+            journal = nil
+            let reopened = try AdmissionJournal(directory: directory, controllerID: controller)
+            XCTAssertEqual(reopened.epoch, epoch)
+            let reopenedInode = try FileManager.default.attributesOfItem(atPath: lockURL.path)[.systemFileNumber] as? NSNumber
+            XCTAssertEqual(reopenedInode, inode)
         }
     }
 }
