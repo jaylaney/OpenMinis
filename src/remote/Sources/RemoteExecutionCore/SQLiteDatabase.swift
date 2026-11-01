@@ -22,24 +22,29 @@ private final class SQLiteConnection {
 
 final class SQLiteDatabase {
     private let handle: SQLiteConnection
+    private let native: any SQLiteNative
+    private var terminalFailure: JournalTransactionError?
     private var connection: OpaquePointer { handle.pointer }
 
-    init(url: URL, ownershipLock: JournalDirectoryLock? = nil) throws {
+    init(url: URL, ownershipLock: JournalDirectoryLock? = nil, native: any SQLiteNative = SystemSQLiteNative()) throws {
+        self.native = native
         // Cover open failure cleanup as well as successful transfer to the connection.
         defer { withExtendedLifetime(ownershipLock) {} }
         var opened: OpaquePointer?
-        let result = sqlite3_open_v2(url.path, &opened, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nil)
+        let result = sqlite3_open_v2(url.path, &opened, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_NOFOLLOW, nil)
         guard result == SQLITE_OK, let opened else {
-            let message = opened.map { String(cString: sqlite3_errmsg($0)) } ?? "Cannot open journal"
             let code = opened.map { sqlite3_errcode($0) } ?? result
             let extendedCode = opened.map { sqlite3_extended_errcode($0) } ?? result
+            let message = opened.map { String(cString: sqlite3_errmsg($0)) } ?? "Cannot open journal"
             if let opened { sqlite3_close_v2(opened) }
             throw JournalStorageError(kind: .sqlite, message: message, sqliteCode: code, sqliteExtendedCode: extendedCode)
         }
         handle = SQLiteConnection(pointer: opened, ownershipLock: ownershipLock)
         try execute("PRAGMA foreign_keys = ON")
         try execute("PRAGMA journal_mode = DELETE")
-        try execute("PRAGMA synchronous = FULL")
+        // DELETE commits need the directory sync after unlinking the rollback
+        // journal. fullfsync selects a sync method, not this additional sync point.
+        try execute("PRAGMA synchronous = EXTRA")
         try execute("PRAGMA fullfsync = ON")
     }
 
@@ -48,6 +53,7 @@ final class SQLiteDatabase {
     }
 
     func query(_ sql: String, _ values: [SQLiteValue] = []) throws -> [[String?]] {
+        try checkHealth()
         var prepared: OpaquePointer?
         guard sqlite3_prepare_v2(connection, sql, -1, &prepared, nil) == SQLITE_OK, let statement = prepared else {
             throw failure()
@@ -66,11 +72,14 @@ final class SQLiteDatabase {
         }
         var rows: [[String?]] = []
         while true {
-            switch sqlite3_step(statement) {
+            switch native.step(statement) {
             case SQLITE_ROW:
-                rows.append((0..<sqlite3_column_count(statement)).map { index in
-                    guard sqlite3_column_type(statement, index) != SQLITE_NULL,
-                          let text = sqlite3_column_text(statement, index) else { return nil }
+                rows.append(try (0..<sqlite3_column_count(statement)).map { index in
+                    guard sqlite3_column_type(statement, index) != SQLITE_NULL else { return nil }
+                    guard let text = native.columnText(statement, index) else {
+                        // Capture errcode before any subsequent native call or finalization.
+                        throw failure()
+                    }
                     return String(cString: text)
                 })
             case SQLITE_DONE: return rows
@@ -92,16 +101,20 @@ final class SQLiteDatabase {
                 do {
                     try execute("ROLLBACK")
                 } catch {
-                    throw JournalTransactionError(originalError: originalError, rollbackError: error)
+                    let failure = JournalTransactionError(originalError: originalError, rollbackError: error)
+                    terminalFailure = failure
+                    throw failure
                 }
             }
             throw originalError
         }
     }
 
-    private func failure() -> JournalStorageError {
-        JournalStorageError(kind: .sqlite, message: String(cString: sqlite3_errmsg(connection)),
-                            sqliteCode: sqlite3_errcode(connection),
-                            sqliteExtendedCode: sqlite3_extended_errcode(connection))
+    /// A rollback failure abandons this owner, regardless of later autocommit state.
+    /// Retain the original composite until destruction; no operation repairs it.
+    func checkHealth() throws {
+        if let terminalFailure { throw terminalFailure }
     }
+
+    private func failure() -> JournalStorageError { native.failure(connection) }
 }

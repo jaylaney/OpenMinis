@@ -14,8 +14,14 @@ public actor AdmissionCoordinator {
         self.controllerID = controllerID
     }
 
+    internal init(directory: URL, controllerID: ControllerID, native: any SQLiteNative) throws {
+        self.journal = try AdmissionJournal(directory: directory, controllerID: controllerID, native: native)
+        self.controllerID = controllerID
+    }
+
     /// Replaces any previous connection. A rejected foreign connection leaves it intact.
     public func connect(controllerID: ControllerID) throws -> ConnectionLease {
+        try journal.checkHealth()
         guard controllerID == self.controllerID else { throw AdmissionError.wrongController }
         let token = UUID()
         currentToken = token
@@ -23,6 +29,7 @@ public actor AdmissionCoordinator {
     }
 
     public func submit(_ request: MutationRequest, over lease: ConnectionLease) throws -> SubmissionResult {
+        try journal.checkHealth()
         guard request.controllerID == controllerID else { throw AdmissionError.wrongController }
         try validate(lease, epoch: request.epoch)
         // No suspension between capability/epoch validation and the durable transaction.
@@ -38,12 +45,13 @@ public actor AdmissionCoordinator {
     }
 
     /// Trusted host-internal snapshot. Use status(over:) for connection reads.
-    public func status() -> AdmissionStatus { journal.status }
+    public func status() throws -> AdmissionStatus { try journal.status }
 
     /// Connection bootstrap/reset discovery deliberately requires no known epoch.
     public func status(over lease: ConnectionLease) throws -> AdmissionStatus {
+        try journal.checkHealth()
         try lease.validate(controllerID: controllerID, currentToken: currentToken)
-        return journal.status
+        return try journal.status
     }
 
     /// Trusted host-internal lookup, qualified by the captured storage namespace.
@@ -66,7 +74,7 @@ public actor AdmissionCoordinator {
     /// This records interruptedUnknown for the whole run, even if a command exit was observed.
     /// A changed recovery state also invalidates every previously issued lease.
     public func confirmRecoveredProcessesAbsent() throws {
-        let wasRecovering = journal.recoveryRequired
+        let wasRecovering = try journal.recoveryRequired
         try journal.confirmRecoveredProcessesAbsent()
         if wasRecovering { currentToken = nil }
     }
@@ -80,7 +88,8 @@ public actor AdmissionCoordinator {
     }
 
     private func validate(_ lease: ConnectionLease, epoch: StorageEpoch) throws {
+        try journal.checkHealth()
         try lease.validate(controllerID: controllerID, currentToken: currentToken)
-        guard epoch == journal.epoch else { throw AdmissionError.staleEpoch }
+        guard epoch == (try journal.epoch) else { throw AdmissionError.staleEpoch }
     }
 }

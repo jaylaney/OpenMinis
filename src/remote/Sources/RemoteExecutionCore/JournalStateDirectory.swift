@@ -5,7 +5,28 @@ import Foundation
 /// ordinary POSIX/ACL privacy, not isolation from hostile code running as this user.
 /// Existing directories and inherited ACLs are never silently repaired.
 enum JournalStateDirectory {
-    static func prepare(_ directory: URL) throws {
+    static func prepare(_ requestedDirectory: URL) throws -> URL {
+        // Reject ambiguous spelling before resolving anything. In particular, link/.
+        // must not make lstat inspect the symlink target instead of the leaf itself.
+        let components = requestedDirectory.path.split(separator: "/")
+        guard requestedDirectory.isFileURL,
+              !components.contains("."), !components.contains(".."),
+              let leaf = components.last else {
+            throw invalid("Journal state directory requires an unambiguous named leaf")
+        }
+        // Host-trusted parent aliases (including macOS /var and /tmp) are valid.
+        // Resolve only that parent and retain the caller's original leaf name.
+        let parentPath = requestedDirectory.deletingLastPathComponent().path
+        guard let canonicalParent = realpath(parentPath, nil) else {
+            let code = errno
+            throw JournalStorageError(kind: .filesystem,
+                message: "Cannot resolve trusted journal state parent: \(String(cString: strerror(code)))", posixCode: code)
+        }
+        defer { free(canonicalParent) }
+        // Foundation's resolvingSymlinksInPath may reintroduce /var or /tmp aliases
+        // on Darwin. POSIX realpath preserves the canonical spelling SQLite requires.
+        let parent = URL(fileURLWithPath: String(cString: canonicalParent), isDirectory: true)
+        let directory = parent.appendingPathComponent(String(leaf), isDirectory: true)
         var info = stat()
         if lstat(directory.path, &info) != 0 {
             let code = errno
@@ -28,9 +49,34 @@ enum JournalStateDirectory {
         }
         guard info.st_uid == geteuid() else { throw invalid("Journal state directory must be owned by the effective user") }
         guard info.st_mode & 0o700 == 0o700, info.st_mode & 0o077 == 0 else {
-            throw invalid("Journal state directory requires owner access and no group or other permissions (0700)")
+            throw invalid("Journal state directory requires owner rwx mode bits and no group or other permissions (0700)")
         }
         try inspectACL(directory, expected: info)
+        try inspectArtifacts(in: directory)
+        return directory
+    }
+
+    private static func inspectArtifacts(in directory: URL) throws {
+        for name in ["admission.lock", "admission.sqlite3", "admission.sqlite3-journal",
+                     "admission.sqlite3-wal", "admission.sqlite3-shm"] {
+            var info = stat()
+            if lstat(directory.appendingPathComponent(name).path, &info) != 0 {
+                let code = errno
+                guard code == ENOENT else {
+                    throw JournalStorageError(kind: .filesystem, message: "Cannot inspect journal state artifact",
+                                              posixCode: code)
+                }
+                continue
+            }
+            try validateArtifact(info)
+        }
+    }
+
+    static func validateArtifact(_ info: stat) throws {
+        guard info.st_mode & S_IFMT == S_IFREG, info.st_uid == geteuid(), info.st_nlink == 1 else {
+            throw JournalStorageError(kind: .filesystem,
+                message: "Journal state artifacts must be regular, effective-user-owned files with one hard link")
+        }
     }
 
     private static func inspectACL(_ directory: URL, expected: stat) throws {

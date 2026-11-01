@@ -69,8 +69,8 @@ final class HostBoundaryAPITests: XCTestCase {
         let composite = JournalTransactionError(originalError: AdmissionError.invalidTransition, rollbackError: rollback)
         XCTAssertEqual(composite.originalError as? AdmissionError, .invalidTransition)
         XCTAssertEqual((composite.rollbackError as? JournalStorageError)?.sqliteCode, 10)
-        XCTAssertTrue(composite.localizedDescription.contains(AdmissionError.invalidTransition.localizedDescription))
-        XCTAssertTrue(composite.localizedDescription.contains(rollback.localizedDescription))
+        XCTAssertTrue(composite.localizedDescription.contains("Run state transition is invalid"))
+        XCTAssertTrue(composite.localizedDescription.contains("synthetic rollback failure"))
         XCTAssertFalse((composite as any Error) is AdmissionError)
     }
     // Status bootstrap needs no known epoch, but all connection reads require the current lease.
@@ -122,7 +122,7 @@ final class HostBoundaryAPITests: XCTestCase {
             let controller = ControllerID()
             var first: AdmissionCoordinator? = try AdmissionCoordinator(directory: leaf, controllerID: controller)
             let old = try await first!.connect(controllerID: controller)
-            let start = request(await first!.status().epoch, controller: controller)
+            let start = request(try await first!.status().epoch, controller: controller)
             _ = try await first!.submit(start, over: old)
             first = nil
             let owner = try AdmissionCoordinator(directory: leaf, controllerID: controller)

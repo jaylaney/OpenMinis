@@ -14,21 +14,48 @@ The fixtures use unique temporary directories and opaque synthetic payloads.
 They exercise SQLite persistence, delayed delivery, leases and recovery without
 network peers or user databases. ACL fixture setup invokes system chmod only
 within disposable temporary directories; it does not qualify managed command
-execution or process supervision.
+execution or process supervision. The internal instance-owned `SQLiteNative`
+boundary defaults to real SQLite. Fault fixtures simulate selected native
+`column_text`/`step` results while exercising production row mapping, transaction
+handling and actor APIs; they do not claim genuine native OOM or rollback-I/O
+injection. Native SQL NULL, ordinary rollback and SQLITE_FULL automatic rollback
+fixtures continue to use real SQLite.
 
 ## Private state and storage errors
 
 Supply a dedicated host state leaf below an existing stable, trusted parent.
 Initialization creates a missing leaf with mode 0700. Before opening the lock or
 SQLite, it rejects a symbolic-link leaf, non-directory, foreign owner, missing
-owner access, any group/other mode permissions, and extended ACL allow entries
+owner rwx mode bits, any group/other mode permissions, and extended ACL allow entries
 (including inherited grants). A successful native security inspection accepts an
-absent ACL or deny-only ACL; inspection failures are refused. Existing leaves,
-parents, contents and ACLs are never silently chmodded, stripped or deleted.
+absent ACL or deny-only ACL; inspection failures are refused. Owner access here
+means mode bits: a deny ACL can still cause a fail-closed EACCES when storage is
+opened. The core does not claim an effective-access or native ACL qualification.
+Existing leaves, parents, contents and ACLs are never silently chmodded, stripped or deleted.
 Host provisioning must explicitly repair older permissive state directories
 while preserving their journal and storage epoch. These ordinary POSIX/ACL checks
 do not isolate against a hostile process running as the same user and do not
 make a shell sandbox. Native filesystem/platform qualification remains required.
+
+The requested path must have a named leaf and no `.` or `..` components. Only its
+trusted parent is canonicalized with POSIX `realpath`, preserving ordinary macOS
+parent aliases; the original leaf is checked without following it. Lock and
+database opens use this single prepared path with `O_NOFOLLOW` and
+`SQLITE_OPEN_NOFOLLOW`. Before either opens, existing `admission.lock`,
+`admission.sqlite3`, and SQLite `-journal`, `-wal`, `-shm` companions must be
+regular files owned by the effective user with one hard link. The opened lock
+descriptor is checked too. Unsafe artifacts are rejected without repair. These
+are cooperative filesystem checks below a stable parent, not hostile same-user
+race isolation.
+
+SQLite uses `journal_mode=DELETE`, `synchronous=EXTRA` (native level 3), and
+`fullfsync=ON`. EXTRA requests the directory synchronization after deleting the
+rollback journal; FULL alone does not request that point, and fullfsync selects
+the synchronization method rather than adding it. The regression reads native
+PRAGMA values and performs a real transaction/close/reopen. It establishes the
+configured durability policy and ordinary persistence, not power-loss behavior;
+genuine power-loss/filesystem qualification remains unperformed. See SQLite's
+[synchronous documentation](https://www.sqlite.org/pragma.html#pragma_synchronous).
 
 `JournalStorageError` is public and exposes a stable `kind` (`alreadyOwned`,
 `sqlite`, `filesystem`, `invalidDirectory`, `invalidState`), diagnostic `message`,
@@ -37,7 +64,18 @@ message is useful without parsing it to classify errors. SQLite diagnostics are
 captured while the handle is valid. `JournalTransactionError` is a separate
 public composite carrying `originalError` and `rollbackError`; both appear in its
 localized diagnostic, even when the original cause is an `AdmissionError`.
-Automatic SQLite rollback preserves its original cause.
+Automatic SQLite rollback preserves its original cause. `AdmissionError` has
+stable short payload-free localized case descriptions. A non-NULL SQLite column
+whose text conversion fails throws its captured storage diagnostic immediately;
+only native SQL NULL maps to an optional nil.
+
+An explicit rollback failure makes that owner terminally unusable. Every actor
+operation, including cached status, connection issuance, reads and administration,
+throws the retained `JournalTransactionError` with both causes until the owner is
+destroyed and storage reopened. It does not silently reset epochs, release the
+ownership lock, expose uncommitted rows, or downgrade the composite to an ordinary
+admission refusal. Reopening still applies the normal durable-state recovery
+rules; process absence remains a separate host responsibility.
 
 ## Admission and status
 
@@ -77,7 +115,9 @@ used anew only with its new epoch.
 `RequestRecord` describes admission or rejection. `admitted` means the run was
 admitted, and `stopRequested` means a Stop was recorded. Neither establishes that
 a command started, terminated or succeeded. Stop keeps the active slot occupied.
-`status()` is a trusted host-internal snapshot. Connection bootstrap uses
+`status() throws -> AdmissionStatus` is a trusted host-internal snapshot; callers
+use `try await coordinator.status()` so a terminal storage condition is visible.
+Connection bootstrap uses
 `status(over:)`, which validates the current controller lease without requiring a
 known epoch. Trusted host lookup uses `runStatus(for:epoch:)`; connection lookup
 uses `runStatus(for:epoch:over:)`, validating both the current lease and epoch.

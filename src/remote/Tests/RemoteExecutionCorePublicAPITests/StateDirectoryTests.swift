@@ -126,7 +126,7 @@ final class StateDirectoryTests: XCTestCase {
         }
     }
 
-    func testNonDirectoryAndOwnerInaccessibleLeavesAreRejectedWithoutChanges() throws {
+    func testNonDirectoryAndMissingOwnerModeBitsAreRejectedWithoutChanges() throws {
         try fixture { root in
             let file = root.appendingPathComponent("file")
             try Data("preserve".utf8).write(to: file)
@@ -140,6 +140,87 @@ final class StateDirectoryTests: XCTestCase {
                 XCTAssertEqual(($0 as? JournalStorageError)?.kind, .invalidDirectory)
             }
             try assertUntouched(leaf, contents: [], mode: 0o500)
+        }
+    }
+
+    // A trailing dot or dot parent must never hide a forbidden symlink leaf.
+    func testDotComponentsCannotBypassSymlinkLeafValidation() throws {
+        try fixture { root in
+            let target = root.appendingPathComponent("target")
+            let link = root.appendingPathComponent("link")
+            try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false,
+                                                    attributes: [.posixPermissions: 0o700])
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+            for suffix in ["/.", "/../target", "/./child"] {
+                let spelled = URL(fileURLWithPath: link.path + suffix)
+                XCTAssertThrowsError(try AdmissionCoordinator(directory: spelled, controllerID: ControllerID()), suffix)
+                try assertUntouched(target, contents: [], mode: 0o700)
+            }
+        }
+    }
+
+    // Resolving the trusted parent is allowed; resolving the untrusted leaf is not.
+    func testTrustedParentAliasAndCanonicalParentShareOwnershipAndReopen() throws {
+        try fixture { root in
+            let parent = root.appendingPathComponent("parent")
+            let alias = root.appendingPathComponent("alias")
+            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
+            try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: parent)
+            let controller = ControllerID()
+            var owner: AdmissionCoordinator? = try AdmissionCoordinator(directory: alias.appendingPathComponent("state"), controllerID: controller)
+            XCTAssertThrowsError(try AdmissionCoordinator(directory: parent.appendingPathComponent("state"), controllerID: controller)) {
+                XCTAssertEqual(($0 as? JournalStorageError)?.kind, .alreadyOwned)
+            }
+            withExtendedLifetime(owner) {}
+            owner = nil
+            let reopened = try AdmissionCoordinator(directory: parent.appendingPathComponent("state"), controllerID: controller)
+            withExtendedLifetime(reopened) {}
+        }
+    }
+
+    func testSymlinkStateArtifactsAreRejectedWithoutTouchingTargets() throws {
+        for name in ["admission.lock", "admission.sqlite3", "admission.sqlite3-journal", "admission.sqlite3-wal", "admission.sqlite3-shm"] {
+            try fixture { root in
+                let leaf = root.appendingPathComponent("state")
+                try FileManager.default.createDirectory(at: leaf, withIntermediateDirectories: false,
+                                                        attributes: [.posixPermissions: 0o700])
+                let target = root.appendingPathComponent("target")
+                // Empty bytes would become a database if SQLite follows the main-file link.
+                try Data().write(to: target)
+                let artifact = leaf.appendingPathComponent(name)
+                try FileManager.default.createSymbolicLink(at: artifact, withDestinationURL: target)
+                XCTAssertThrowsError(try AdmissionCoordinator(directory: leaf, controllerID: ControllerID()), name)
+                XCTAssertEqual(try Data(contentsOf: target), Data(), name)
+                XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: artifact.path), target.path)
+                try assertUntouched(leaf, contents: [name], mode: 0o700)
+            }
+        }
+    }
+
+    func testHardLinkedStateArtifactsAreRejectedWithoutChanges() throws {
+        for name in ["admission.lock", "admission.sqlite3", "admission.sqlite3-journal", "admission.sqlite3-wal", "admission.sqlite3-shm"] {
+            try fixture { root in
+                let leaf = root.appendingPathComponent("state")
+                try FileManager.default.createDirectory(at: leaf, withIntermediateDirectories: false,
+                                                        attributes: [.posixPermissions: 0o700])
+                let target = root.appendingPathComponent("target")
+                try Data().write(to: target)
+                try FileManager.default.linkItem(at: target, to: leaf.appendingPathComponent(name))
+                XCTAssertThrowsError(try AdmissionCoordinator(directory: leaf, controllerID: ControllerID()), name)
+                XCTAssertEqual(try Data(contentsOf: target), Data(), name)
+                try assertUntouched(leaf, contents: [name], mode: 0o700)
+            }
+        }
+    }
+
+    func testNonregularStateArtifactsAreRejectedWithoutChanges() throws {
+        for name in ["admission.lock", "admission.sqlite3", "admission.sqlite3-journal", "admission.sqlite3-wal", "admission.sqlite3-shm"] {
+            try fixture { root in
+                let artifact = root.appendingPathComponent(name)
+                try FileManager.default.createDirectory(at: artifact, withIntermediateDirectories: false)
+                XCTAssertThrowsError(try AdmissionCoordinator(directory: root, controllerID: ControllerID()), name)
+                try assertUntouched(root, contents: [name], mode: 0o700)
+            }
         }
     }
 

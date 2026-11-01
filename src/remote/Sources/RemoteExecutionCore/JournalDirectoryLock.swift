@@ -8,10 +8,21 @@ final class JournalDirectoryLock {
 
     init(directory: URL) throws {
         let path = directory.appendingPathComponent("admission.lock").path
-        let opened = open(path, O_RDWR | O_CREAT | O_CLOEXEC, S_IRUSR | S_IWUSR)
+        let opened = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, S_IRUSR | S_IWUSR)
         guard opened >= 0 else {
             let code = errno
             throw JournalStorageError(kind: .filesystem, message: "Cannot open journal ownership lock: \(String(cString: strerror(code)))", posixCode: code)
+        }
+        do {
+            var info = stat()
+            guard fstat(opened, &info) == 0 else {
+                let code = errno
+                throw JournalStorageError(kind: .filesystem, message: "Cannot inspect opened journal ownership lock", posixCode: code)
+            }
+            try JournalStateDirectory.validateArtifact(info)
+        } catch {
+            close(opened)
+            throw error
         }
         guard flock(opened, LOCK_EX | LOCK_NB) == 0 else {
             let code = errno

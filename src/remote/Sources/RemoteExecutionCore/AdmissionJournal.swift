@@ -5,16 +5,21 @@ import Foundation
 /// authentication, OS process inspection, or process supervision occurs here.
 final class AdmissionJournal {
     private let database: SQLiteDatabase
-    private(set) var status: AdmissionStatus
-    var epoch: StorageEpoch { status.epoch }
-    var recoveryRequired: Bool { status.recoveryRequired }
+    private var cachedStatus: AdmissionStatus
+    var status: AdmissionStatus {
+        get throws { try checkHealth(); return cachedStatus }
+    }
+    var epoch: StorageEpoch { get throws { try status.epoch } }
+    var recoveryRequired: Bool { get throws { try status.recoveryRequired } }
 
-    init(directory: URL, controllerID: ControllerID) throws {
-        try JournalStateDirectory.prepare(directory)
-        let ownershipLock = try JournalDirectoryLock(directory: directory)
-        database = try SQLiteDatabase(url: directory.appendingPathComponent("admission.sqlite3"), ownershipLock: ownershipLock)
+    func checkHealth() throws { try database.checkHealth() }
+
+    init(directory: URL, controllerID: ControllerID, native: any SQLiteNative = SystemSQLiteNative()) throws {
+        let preparedDirectory = try JournalStateDirectory.prepare(directory)
+        let ownershipLock = try JournalDirectoryLock(directory: preparedDirectory)
+        database = try SQLiteDatabase(url: preparedDirectory.appendingPathComponent("admission.sqlite3"), ownershipLock: ownershipLock, native: native)
         // A temporary initialization value is replaced by persisted state before init returns.
-        status = AdmissionStatus(epoch: StorageEpoch(), recoveryRequired: false, activeRun: nil)
+        cachedStatus = AdmissionStatus(epoch: StorageEpoch(), recoveryRequired: false, activeRun: nil)
         try database.transaction {
             try database.execute("""
                 CREATE TABLE IF NOT EXISTS journal (
@@ -52,7 +57,7 @@ final class AdmissionJournal {
             try validateController(controllerID)
             // Opening unresolved work conservatively requires host-confirmed absence.
             try database.execute("UPDATE journal SET recovery = 1 WHERE EXISTS(SELECT 1 FROM runs WHERE state != 'settled')")
-            status = try readStatus()
+            cachedStatus = try readStatus()
         }
     }
 
@@ -164,7 +169,7 @@ final class AdmissionJournal {
             let result = try body()
             return (result, try readStatus())
         }
-        status = nextStatus
+        cachedStatus = nextStatus
         return result
     }
 

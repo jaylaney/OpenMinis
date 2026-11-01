@@ -88,8 +88,19 @@ public struct AdmissionStatus: Equatable, Sendable {
     public let activeRun: RunRecord?
 }
 
-public enum AdmissionError: Error, Equatable, Sendable {
+public enum AdmissionError: Error, LocalizedError, Equatable, Sendable {
     case staleEpoch, payloadConflict, recoveryRequired, invalidTransition, wrongController, staleConnection
+
+    public var errorDescription: String? {
+        switch self {
+        case .staleEpoch: "Storage epoch is stale"
+        case .payloadConflict: "Request payload conflicts with its durable record"
+        case .recoveryRequired: "Process recovery is required"
+        case .invalidTransition: "Run state transition is invalid"
+        case .wrongController: "Controller does not match the journal"
+        case .staleConnection: "Connection lease is stale"
+        }
+    }
 }
 
 /// An opaque capability for one connection to one coordinator instance.
