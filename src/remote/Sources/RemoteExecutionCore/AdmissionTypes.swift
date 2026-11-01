@@ -75,6 +75,7 @@ public enum RunOutcome: String, Codable, Sendable { case completed, failed, inte
 public enum RunState: String, Codable, Sendable { case active, stopRequested, settled }
 
 public struct RunRecord: Codable, Equatable, Sendable {
+    public let epoch: StorageEpoch
     public let sessionID: SessionID
     public let runID: RunID
     public let state: RunState

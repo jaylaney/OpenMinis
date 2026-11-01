@@ -10,15 +10,16 @@ final class JournalDirectoryLock {
         let path = directory.appendingPathComponent("admission.lock").path
         let opened = open(path, O_RDWR | O_CREAT | O_CLOEXEC, S_IRUSR | S_IWUSR)
         guard opened >= 0 else {
-            throw JournalStorageError(message: "Cannot open journal ownership lock: \(String(cString: strerror(errno)))")
+            let code = errno
+            throw JournalStorageError(kind: .filesystem, message: "Cannot open journal ownership lock: \(String(cString: strerror(code)))", posixCode: code)
         }
         guard flock(opened, LOCK_EX | LOCK_NB) == 0 else {
             let code = errno
             close(opened)
             if code == EWOULDBLOCK {
-                throw JournalStorageError(message: "Journal directory already owned")
+                throw JournalStorageError(kind: .alreadyOwned, message: "Journal directory already owned", posixCode: code)
             }
-            throw JournalStorageError(message: "Cannot acquire journal ownership lock: \(String(cString: strerror(code)))")
+            throw JournalStorageError(kind: .filesystem, message: "Cannot acquire journal ownership lock: \(String(cString: strerror(code)))", posixCode: code)
         }
         descriptor = opened
     }

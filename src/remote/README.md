@@ -12,7 +12,32 @@ swift test --package-path src/remote --scratch-path /private/tmp/openminis-remot
 
 The fixtures use unique temporary directories and opaque synthetic payloads.
 They exercise SQLite persistence, delayed delivery, leases and recovery without
-network peers, user databases or OS processes.
+network peers or user databases. ACL fixture setup invokes system chmod only
+within disposable temporary directories; it does not qualify managed command
+execution or process supervision.
+
+## Private state and storage errors
+
+Supply a dedicated host state leaf below an existing stable, trusted parent.
+Initialization creates a missing leaf with mode 0700. Before opening the lock or
+SQLite, it rejects a symbolic-link leaf, non-directory, foreign owner, missing
+owner access, any group/other mode permissions, and extended ACL allow entries
+(including inherited grants). A successful native security inspection accepts an
+absent ACL or deny-only ACL; inspection failures are refused. Existing leaves,
+parents, contents and ACLs are never silently chmodded, stripped or deleted.
+Host provisioning must explicitly repair older permissive state directories
+while preserving their journal and storage epoch. These ordinary POSIX/ACL checks
+do not isolate against a hostile process running as the same user and do not
+make a shell sandbox. Native filesystem/platform qualification remains required.
+
+`JournalStorageError` is public and exposes a stable `kind` (`alreadyOwned`,
+`sqlite`, `filesystem`, `invalidDirectory`, `invalidState`), diagnostic `message`,
+optional SQLite primary/extended codes and optional POSIX code. Its localized
+message is useful without parsing it to classify errors. SQLite diagnostics are
+captured while the handle is valid. `JournalTransactionError` is a separate
+public composite carrying `originalError` and `rollbackError`; both appear in its
+localized diagnostic, even when the original cause is an `AdmissionError`.
+Automatic SQLite rollback preserves its original cause.
 
 ## Admission and status
 
@@ -52,9 +77,14 @@ used anew only with its new epoch.
 `RequestRecord` describes admission or rejection. `admitted` means the run was
 admitted, and `stopRequested` means a Stop was recorded. Neither establishes that
 a command started, terminated or succeeded. Stop keeps the active slot occupied.
-`status()` reports the epoch, recovery requirement and unresolved active run;
-`runStatus(for:)` reports run state and any settled outcome. Only explicit host
-settlement releases an active slot during normal operation. Late Stop requests
+`status()` is a trusted host-internal snapshot. Connection bootstrap uses
+`status(over:)`, which validates the current controller lease without requiring a
+known epoch. Trusted host lookup uses `runStatus(for:epoch:)`; connection lookup
+uses `runStatus(for:epoch:over:)`, validating both the current lease and epoch.
+There is no public bare-RunID lookup. Run lookup rejects an old epoch before
+querying the run, so a reused ID cannot disclose replacement state. `RunRecord`
+includes its verified epoch along with run state and any settled outcome. Only
+explicit host settlement releases an active slot during normal operation. Late Stop requests
 for another run cannot change the current run. Automatic Stop retry must never
 resurrect a tombstoned or otherwise terminally refused ID. After a definitive
 `rejectedAbsent` or other terminal refusal, first check that the same target still
@@ -69,6 +99,11 @@ explicit later Send needs a new ID. The host must verify
 that recovered processes are absent before calling
 `confirmRecoveredProcessesAbsent()`. That call records `interruptedUnknown` for
 unresolved work and invalidates previous leases only if recovery actually changed.
+Process absence is asserted when the call is made; an observed command exit does
+not prove that the entire agent run completed. Recovery conservatively records
+`interruptedUnknown` at run level. A later supervisor must separately retain any
+observed tool-level evidence; recovered commands or agent loops never resume
+automatically.
 A no-op confirmation preserves the current lease. `reset()` requires no active or
 recovery-blocked work, preserves controller binding, creates a fresh storage
 epoch and invalidates previous leases. Old-epoch submissions, reconciliations
@@ -82,9 +117,10 @@ verify process absence, and serve the public actor methods through its chosen
 transport. Controller IDs and leases here are local admission capabilities; this
 core does not authenticate people, encrypt a channel or supervise processes.
 
-`settle(runID:epoch:outcome:)`, `confirmRecoveredProcessesAbsent()` and `reset()` are
-host-internal integration APIs. They must not be exposed as unauthenticated
-remote operations. The host must observe actual termination before settlement;
+`status()`, `runStatus(for:epoch:)`, `settle(runID:epoch:outcome:)`,
+`confirmRecoveredProcessesAbsent()` and `reset()` are host-internal integration
+APIs. Connection reads must use the lease-validated overloads. Host-internal APIs
+must not be exposed as unauthenticated remote operations. The host must observe actual termination before settlement;
 Stop acknowledgement alone is insufficient. Capture the storage epoch when the
 run is admitted and pass that captured epoch to settlement. Connection leases
 may change while a run continues, so settlement does not use a lease. An old-epoch

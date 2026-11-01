@@ -84,7 +84,7 @@ final class AdmissionJournalTests: XCTestCase {
             journal = nil
             let reopened = try AdmissionJournal(directory: directory, controllerID: controller)
             XCTAssertEqual(try reopened.record(busy).record.disposition, .rejectedBusy)
-            XCTAssertNil(try reopened.runStatus(for: busy.runID))
+            XCTAssertNil(try reopened.runStatus(for: busy.runID, epoch: reopened.epoch))
         }
     }
 
@@ -110,7 +110,7 @@ final class AdmissionJournalTests: XCTestCase {
             XCTAssertEqual(try journal.record(lateStop).record.disposition, .rejectedRunUnavailable)
             XCTAssertEqual(journal.status.activeRun?.runID, later.runID)
             XCTAssertEqual(journal.status.activeRun?.state, .active)
-            XCTAssertEqual(try journal.runStatus(for: first.runID)?.outcome, .completed)
+            XCTAssertEqual(try journal.runStatus(for: first.runID, epoch: journal.epoch)?.outcome, .completed)
         }
     }
 
@@ -136,7 +136,7 @@ final class AdmissionJournalTests: XCTestCase {
             }
             try reopened.confirmRecoveredProcessesAbsent()
             XCTAssertFalse(reopened.recoveryRequired)
-            XCTAssertEqual(try reopened.runStatus(for: first.runID)?.outcome, .interruptedUnknown)
+            XCTAssertEqual(try reopened.runStatus(for: first.runID, epoch: reopened.epoch)?.outcome, .interruptedUnknown)
             XCTAssertEqual(try reopened.record(next).record.disposition, .rejectedBusy)
             XCTAssertEqual(try reopened.record(request(reopened.epoch, controller: first.controllerID)).record.disposition, .admitted)
         }
@@ -193,7 +193,7 @@ final class AdmissionJournalTests: XCTestCase {
             assertAdmissionError(.staleEpoch) {
                 try journal.settle(runID: first.runID, epoch: first.epoch, outcome: .completed)
             }
-            let stillActive = try journal.runStatus(for: reused.runID)
+            let stillActive = try journal.runStatus(for: reused.runID, epoch: journal.epoch)
             XCTAssertEqual(stillActive?.sessionID, reused.sessionID)
             XCTAssertEqual(stillActive?.state, .active)
             XCTAssertNil(stillActive?.outcome)
@@ -201,7 +201,7 @@ final class AdmissionJournalTests: XCTestCase {
             XCTAssertEqual(try journal.record(request(nextEpoch, controller: first.controllerID)).record.disposition, .rejectedBusy)
 
             try journal.settle(runID: reused.runID, epoch: reused.epoch, outcome: .completed)
-            XCTAssertEqual(try journal.runStatus(for: reused.runID)?.outcome, .completed)
+            XCTAssertEqual(try journal.runStatus(for: reused.runID, epoch: journal.epoch)?.outcome, .completed)
             XCTAssertNil(journal.status.activeRun)
         }
     }
@@ -242,7 +242,7 @@ final class AdmissionJournalTests: XCTestCase {
             let replay = try reopened.record(refused)
             XCTAssertTrue(replay.isReplay)
             XCTAssertEqual(replay.record, refusal.record)
-            XCTAssertNil(try reopened.runStatus(for: refused.runID))
+            XCTAssertNil(try reopened.runStatus(for: refused.runID, epoch: reopened.epoch))
             let newSend = try reopened.record(request(first.epoch))
             XCTAssertFalse(newSend.isReplay)
             XCTAssertEqual(newSend.record.disposition, .admitted)
@@ -271,7 +271,7 @@ final class AdmissionJournalTests: XCTestCase {
 
     func testFailedSQLiteInitializationReleasesStableLock() throws {
         try fixture { directory in
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             let databaseURL = directory.appendingPathComponent("admission.sqlite3")
             let lockURL = directory.appendingPathComponent("admission.lock")
             try Data("invalid SQLite database".utf8).write(to: databaseURL)
@@ -291,4 +291,30 @@ final class AdmissionJournalTests: XCTestCase {
             XCTAssertEqual(reopenedInode, inode)
         }
     }
+    // Namespace validation must precede decoding even a malformed replacement row.
+    func testOldEpochReadAndSettlementRejectBeforeMalformedReplacementDecode() throws {
+        try fixture { directory in
+            let journal = try AdmissionJournal(directory: directory, controllerID: controller)
+            let first = request(journal.epoch)
+            _ = try journal.record(first)
+            try journal.settle(runID: first.runID, epoch: first.epoch, outcome: .completed)
+            let nextEpoch = try journal.reset()
+            let replacement = request(nextEpoch, run: first.runID)
+            _ = try journal.record(replacement)
+            // Deliberately corrupt only a disposable fixture, bypassing the kernel API.
+            let raw = try SQLiteDatabase(url: directory.appendingPathComponent("admission.sqlite3"))
+            try raw.execute("UPDATE runs SET session_id = 'not-a-uuid'")
+            assertAdmissionError(.staleEpoch) {
+                _ = try journal.runStatus(for: first.runID, epoch: first.epoch)
+            }
+            assertAdmissionError(.staleEpoch) {
+                try journal.settle(runID: first.runID, epoch: first.epoch, outcome: .completed)
+            }
+            XCTAssertThrowsError(try journal.runStatus(for: replacement.runID, epoch: nextEpoch)) {
+                XCTAssertEqual(($0 as? JournalStorageError)?.kind, .invalidState)
+                XCTAssertFalse($0.localizedDescription.isEmpty)
+            }
+        }
+    }
+
 }

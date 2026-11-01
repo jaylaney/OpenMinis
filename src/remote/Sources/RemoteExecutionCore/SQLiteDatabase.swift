@@ -1,11 +1,6 @@
 import CSQLite
 import Foundation
 
-/// Errors expose SQLite diagnostics, never opaque request payloads (which are not stored).
-struct JournalStorageError: Error {
-    let message: String
-}
-
 enum SQLiteValue {
     case text(String), null
 }
@@ -25,11 +20,6 @@ private final class SQLiteConnection {
     }
 }
 
-struct JournalTransactionError: Error {
-    let originalError: any Error
-    let rollbackError: any Error
-}
-
 final class SQLiteDatabase {
     private let handle: SQLiteConnection
     private var connection: OpaquePointer { handle.pointer }
@@ -41,8 +31,10 @@ final class SQLiteDatabase {
         let result = sqlite3_open_v2(url.path, &opened, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nil)
         guard result == SQLITE_OK, let opened else {
             let message = opened.map { String(cString: sqlite3_errmsg($0)) } ?? "Cannot open journal"
+            let code = opened.map { sqlite3_errcode($0) } ?? result
+            let extendedCode = opened.map { sqlite3_extended_errcode($0) } ?? result
             if let opened { sqlite3_close_v2(opened) }
-            throw JournalStorageError(message: message)
+            throw JournalStorageError(kind: .sqlite, message: message, sqliteCode: code, sqliteExtendedCode: extendedCode)
         }
         handle = SQLiteConnection(pointer: opened, ownershipLock: ownershipLock)
         try execute("PRAGMA foreign_keys = ON")
@@ -108,6 +100,8 @@ final class SQLiteDatabase {
     }
 
     private func failure() -> JournalStorageError {
-        JournalStorageError(message: String(cString: sqlite3_errmsg(connection)))
+        JournalStorageError(kind: .sqlite, message: String(cString: sqlite3_errmsg(connection)),
+                            sqliteCode: sqlite3_errcode(connection),
+                            sqliteExtendedCode: sqlite3_extended_errcode(connection))
     }
 }

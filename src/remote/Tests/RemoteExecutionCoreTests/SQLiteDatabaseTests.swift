@@ -15,6 +15,9 @@ final class SQLiteDatabaseTests: XCTestCase {
         XCTAssertThrowsError(try database.transaction {
             try database.execute("INSERT INTO fixture VALUES(zeroblob(65536))")
         }) {
+            XCTAssertEqual(($0 as? JournalStorageError)?.kind, .sqlite)
+            XCTAssertEqual(($0 as? JournalStorageError)?.sqliteCode, 13) // SQLITE_FULL
+            XCTAssertEqual(($0 as? JournalStorageError)?.sqliteExtendedCode, 13)
             XCTAssertTrue(($0 as? JournalStorageError)?.message.contains("full") == true,
                           "Expected original SQLITE_FULL diagnostic, received \($0)")
         }

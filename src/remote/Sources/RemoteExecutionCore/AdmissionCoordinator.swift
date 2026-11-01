@@ -37,10 +37,23 @@ public actor AdmissionCoordinator {
         return try journal.lookupOrRejectAbsent(requestID, controllerID: controllerID)
     }
 
+    /// Trusted host-internal snapshot. Use status(over:) for connection reads.
     public func status() -> AdmissionStatus { journal.status }
 
-    public func runStatus(for runID: RunID) throws -> RunRecord? {
-        try journal.runStatus(for: runID)
+    /// Connection bootstrap/reset discovery deliberately requires no known epoch.
+    public func status(over lease: ConnectionLease) throws -> AdmissionStatus {
+        try lease.validate(controllerID: controllerID, currentToken: currentToken)
+        return journal.status
+    }
+
+    /// Trusted host-internal lookup, qualified by the captured storage namespace.
+    public func runStatus(for runID: RunID, epoch: StorageEpoch) throws -> RunRecord? {
+        try journal.runStatus(for: runID, epoch: epoch)
+    }
+
+    public func runStatus(for runID: RunID, epoch: StorageEpoch, over lease: ConnectionLease) throws -> RunRecord? {
+        try validate(lease, epoch: epoch)
+        return try journal.runStatus(for: runID, epoch: epoch)
     }
 
     /// Host-internal: observe actual termination and supply the epoch captured at admission.
@@ -50,6 +63,7 @@ public actor AdmissionCoordinator {
     }
 
     /// Host-internal: the caller must independently verify recovered processes are absent.
+    /// This records interruptedUnknown for the whole run, even if a command exit was observed.
     /// A changed recovery state also invalidates every previously issued lease.
     public func confirmRecoveredProcessesAbsent() throws {
         let wasRecovering = journal.recoveryRequired

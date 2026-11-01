@@ -204,7 +204,7 @@ final class AdmissionCoordinatorTests: XCTestCase {
             let stop = request(epoch, controller: controller, session: first.sessionID, run: first.runID, kind: .stopRun)
             let stopRecord = try await coordinator.submit(stop, over: lease)
             XCTAssertEqual(stopRecord.record.disposition, .stopRequested)
-            let pending = try await coordinator.runStatus(for: first.runID)
+            let pending = try await coordinator.runStatus(for: first.runID, epoch: first.epoch)
             XCTAssertEqual(pending?.state, .stopRequested)
             XCTAssertNil(pending?.outcome)
             let busy = try await coordinator.submit(request(epoch, controller: controller), over: lease)
@@ -218,7 +218,7 @@ final class AdmissionCoordinatorTests: XCTestCase {
             let status = await coordinator.status()
             XCTAssertEqual(status.activeRun?.runID, later.runID)
             XCTAssertEqual(status.activeRun?.state, .active)
-            let settled = try await coordinator.runStatus(for: first.runID)
+            let settled = try await coordinator.runStatus(for: first.runID, epoch: first.epoch)
             XCTAssertEqual(settled?.outcome, .completed)
         }
     }
@@ -244,7 +244,7 @@ final class AdmissionCoordinatorTests: XCTestCase {
             await assertError(.staleEpoch) {
                 try await coordinator.settle(runID: first.runID, epoch: first.epoch, outcome: .completed)
             }
-            let stillActive = try await coordinator.runStatus(for: reused.runID)
+            let stillActive = try await coordinator.runStatus(for: reused.runID, epoch: reused.epoch)
             XCTAssertEqual(stillActive?.sessionID, reused.sessionID)
             XCTAssertEqual(stillActive?.state, .active)
             XCTAssertNil(stillActive?.outcome)
@@ -254,7 +254,7 @@ final class AdmissionCoordinatorTests: XCTestCase {
             XCTAssertEqual(busy.record.disposition, .rejectedBusy)
 
             try await coordinator.settle(runID: reused.runID, epoch: reused.epoch, outcome: .completed)
-            let settled = try await coordinator.runStatus(for: reused.runID)
+            let settled = try await coordinator.runStatus(for: reused.runID, epoch: reused.epoch)
             XCTAssertEqual(settled?.outcome, .completed)
             let idle = await coordinator.status()
             XCTAssertNil(idle.activeRun)
@@ -286,7 +286,7 @@ final class AdmissionCoordinatorTests: XCTestCase {
             try await reopened.confirmRecoveredProcessesAbsent()
             await assertError(.staleConnection) { _ = try await reopened.submit(next, over: recoveryLease) }
             let afterRecovery = try await reopened.connect(controllerID: controller)
-            let recovered = try await reopened.runStatus(for: mutation.runID)
+            let recovered = try await reopened.runStatus(for: mutation.runID, epoch: mutation.epoch)
             XCTAssertEqual(recovered?.outcome, .interruptedUnknown)
             let newEpoch = try await reopened.reset()
             XCTAssertNotEqual(newEpoch, mutation.epoch)
@@ -328,8 +328,7 @@ final class AdmissionCoordinatorTests: XCTestCase {
             _ = try await owner!.submit(start, over: lease)
             for candidate in [controller, ControllerID()] {
                 XCTAssertThrowsError(try AdmissionCoordinator(directory: directory, controllerID: candidate)) {
-                    XCTAssertTrue($0 is JournalStorageError)
-                    XCTAssertTrue(String(describing: $0).contains("already owned"))
+                    XCTAssertEqual(($0 as? JournalStorageError)?.kind, .alreadyOwned)
                 }
             }
             let stop = request(start.epoch, controller: controller, session: start.sessionID,
@@ -341,7 +340,7 @@ final class AdmissionCoordinatorTests: XCTestCase {
             let status = await reopened.status()
             XCTAssertEqual(status.epoch, start.epoch)
             XCTAssertFalse(status.recoveryRequired)
-            let settled = try await reopened.runStatus(for: start.runID)
+            let settled = try await reopened.runStatus(for: start.runID, epoch: start.epoch)
             XCTAssertEqual(settled?.outcome, .completed)
         }
     }

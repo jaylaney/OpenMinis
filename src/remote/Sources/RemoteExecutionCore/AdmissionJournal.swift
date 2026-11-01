@@ -10,7 +10,7 @@ final class AdmissionJournal {
     var recoveryRequired: Bool { status.recoveryRequired }
 
     init(directory: URL, controllerID: ControllerID) throws {
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try JournalStateDirectory.prepare(directory)
         let ownershipLock = try JournalDirectoryLock(directory: directory)
         database = try SQLiteDatabase(url: directory.appendingPathComponent("admission.sqlite3"), ownershipLock: ownershipLock)
         // A temporary initialization value is replaced by persisted state before init returns.
@@ -56,8 +56,17 @@ final class AdmissionJournal {
         }
     }
 
-    func runStatus(for runID: RunID) throws -> RunRecord? {
-        try database.query("SELECT session_id, run_id, state, outcome FROM runs WHERE run_id = ?", [.text(runID.rawValue.uuidString)]).first.map(decodeRun)
+    func runStatus(for runID: RunID, epoch: StorageEpoch) throws -> RunRecord? {
+        let currentEpoch = try readEpoch()
+        guard epoch == currentEpoch else { throw AdmissionError.staleEpoch }
+        return try database.query("SELECT session_id, run_id, state, outcome FROM runs WHERE run_id = ?", [.text(runID.rawValue.uuidString)])
+            .first.map { try decodeRun($0, epoch: currentEpoch) }
+    }
+
+    private func readEpoch() throws -> StorageEpoch {
+        guard let epochText = try database.query("SELECT epoch FROM journal").first?[0],
+              let value = UUID(uuidString: epochText) else { throw corrupt() }
+        return StorageEpoch(rawValue: value)
     }
 
     func record(_ request: MutationRequest) throws -> SubmissionResult {
@@ -76,7 +85,7 @@ final class AdmissionJournal {
             case .startRun:
                 if current.recoveryRequired || current.activeRun != nil {
                     disposition = .rejectedBusy
-                } else if try runStatus(for: request.runID) != nil {
+                } else if try runStatus(for: request.runID, epoch: request.epoch) != nil {
                     disposition = .rejectedRunUnavailable
                 } else {
                     try database.execute("INSERT INTO runs(run_id, session_id, state) VALUES(?, ?, 'active')", [
@@ -114,10 +123,8 @@ final class AdmissionJournal {
     /// Host-internal settlement: use the admitted run's epoch after observing actual termination.
     func settle(runID: RunID, epoch: StorageEpoch, outcome: RunOutcome) throws {
         try update {
-            guard let epochText = try database.query("SELECT epoch FROM journal").first?[0],
-                  let currentEpoch = UUID(uuidString: epochText) else { throw corrupt() }
-            guard epoch.rawValue == currentEpoch else { throw AdmissionError.staleEpoch }
-            guard let run = try runStatus(for: runID) else { throw AdmissionError.invalidTransition }
+            guard epoch == (try readEpoch()) else { throw AdmissionError.staleEpoch }
+            guard let run = try runStatus(for: runID, epoch: epoch) else { throw AdmissionError.invalidTransition }
             if run.state == .settled {
                 guard run.outcome == outcome else { throw AdmissionError.invalidTransition }
                 return
@@ -128,6 +135,8 @@ final class AdmissionJournal {
     }
 
     /// The authenticated host must independently confirm that recovered processes are absent.
+    /// Command exit evidence does not prove that the agent run completed. Recovery
+    /// conservatively records interruptedUnknown and never resumes a command or loop.
     func confirmRecoveredProcessesAbsent() throws {
         try update {
             let current = try readStatus()
@@ -178,11 +187,13 @@ final class AdmissionJournal {
         guard let row = try database.query("SELECT epoch, recovery FROM journal").first,
               let epochText = row[0], let uuid = UUID(uuidString: epochText),
               let recovery = row[1], recovery == "0" || recovery == "1" else { throw corrupt() }
-        let active = try database.query("SELECT session_id, run_id, state, outcome FROM runs WHERE state != 'settled'").first.map(decodeRun)
-        return AdmissionStatus(epoch: StorageEpoch(rawValue: uuid), recoveryRequired: recovery == "1", activeRun: active)
+        let epoch = StorageEpoch(rawValue: uuid)
+        let active = try database.query("SELECT session_id, run_id, state, outcome FROM runs WHERE state != 'settled'")
+            .first.map { try decodeRun($0, epoch: epoch) }
+        return AdmissionStatus(epoch: epoch, recoveryRequired: recovery == "1", activeRun: active)
     }
 
-    private func decodeRun(_ row: [String?]) throws -> RunRecord {
+    private func decodeRun(_ row: [String?], epoch: StorageEpoch) throws -> RunRecord {
         guard let sessionText = row[0], let session = UUID(uuidString: sessionText),
               let runText = row[1], let run = UUID(uuidString: runText),
               let stateText = row[2], let state = RunState(rawValue: stateText) else { throw corrupt() }
@@ -190,7 +201,7 @@ final class AdmissionJournal {
             guard let value = RunOutcome(rawValue: text) else { throw corrupt() }
             return value
         }
-        return RunRecord(sessionID: SessionID(rawValue: session), runID: RunID(rawValue: run), state: state, outcome: outcome)
+        return RunRecord(epoch: epoch, sessionID: SessionID(rawValue: session), runID: RunID(rawValue: run), state: state, outcome: outcome)
     }
 
     private func lookup(_ id: RequestID) throws -> RequestRecord? {
@@ -228,7 +239,7 @@ final class AdmissionJournal {
     }
 
     private func value(_ string: String?) -> SQLiteValue { string.map(SQLiteValue.text) ?? .null }
-    private func corrupt() -> JournalStorageError { JournalStorageError(message: "Invalid journal state") }
+    private func corrupt() -> JournalStorageError { JournalStorageError(kind: .invalidState, message: "Invalid journal state") }
 
     /// Versioned, length-prefixed UTF-8 metadata plus opaque bytes, with no delimiter ambiguity.
     private func fingerprint(_ request: MutationRequest) -> Data {

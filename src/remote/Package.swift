@@ -8,7 +8,8 @@ let package = Package(
     targets: [
         .systemLibrary(name: "CSQLite"),
         .target(name: "RemoteExecutionCore", dependencies: ["CSQLite"]),
-        .testTarget(name: "RemoteExecutionCoreTests", dependencies: ["RemoteExecutionCore"])
+        .testTarget(name: "RemoteExecutionCoreTests", dependencies: ["RemoteExecutionCore"]),
+        .testTarget(name: "RemoteExecutionCorePublicAPITests", dependencies: ["RemoteExecutionCore"])
     ],
     swiftLanguageModes: [.v6]
 )
