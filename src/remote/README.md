@@ -24,7 +24,7 @@ fixtures continue to use real SQLite.
 ## Private state and storage errors
 
 Supply a dedicated host state leaf below an existing stable, trusted parent.
-Initialization creates a missing leaf with mode 0700. Before opening the lock or
+Initialization creates a missing leaf and normalizes only that newly created leaf to mode 0700, independently of the process umask. An existing leaf or an EEXIST result is never normalized. Before opening the lock or
 SQLite, it rejects a symbolic-link leaf, non-directory, foreign owner, missing
 owner rwx mode bits, any group/other mode permissions, and extended ACL allow entries
 (including inherited grants). A successful native security inspection accepts an
@@ -49,7 +49,12 @@ are cooperative filesystem checks below a stable parent, not hostile same-user
 race isolation.
 
 SQLite uses `journal_mode=DELETE`, `synchronous=EXTRA` (native level 3), and
-`fullfsync=ON`. EXTRA requests the directory synchronization after deleting the
+`fullfsync=ON`. Initialization verifies effective DELETE mode and synchronous
+EXTRA (3) before journal initialization and refuses a missing or unexpected
+result with a structured storage error. The synchronous setter returns no
+row, so its effective value is queried separately. These are defensive policy
+checks, not evidence of a reproduced silent WAL-mode failure. EXTRA requests
+the directory synchronization after deleting the
 rollback journal; FULL alone does not request that point, and fullfsync selects
 the synchronization method rather than adding it. The regression reads native
 PRAGMA values and performs a real transaction/close/reopen. It establishes the

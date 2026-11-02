@@ -39,6 +39,14 @@ enum JournalStateDirectory {
                         message: "Cannot create journal state directory: \(String(cString: strerror(creationCode)))",
                         posixCode: creationCode)
                 }
+            } else if chmod(directory.path, mode_t(0o700)) != 0 {
+                // Normalize only the leaf this call created. A restrictive umask
+                // can remove every owner bit, preventing a descriptor open first.
+                // The parent is host-trusted; this is not hostile same-user isolation.
+                let code = errno
+                throw JournalStorageError(kind: .filesystem,
+                    message: "Cannot set created journal state directory mode: \(String(cString: strerror(code)))",
+                    posixCode: code)
             }
             guard lstat(directory.path, &info) == 0 else {
                 throw invalid("Cannot inspect created journal state directory", code: errno)

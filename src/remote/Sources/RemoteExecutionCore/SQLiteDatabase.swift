@@ -41,10 +41,18 @@ final class SQLiteDatabase {
         }
         handle = SQLiteConnection(pointer: opened, ownershipLock: ownershipLock)
         try execute("PRAGMA foreign_keys = ON")
-        try execute("PRAGMA journal_mode = DELETE")
+        // The setter returns the effective mode; success alone does not establish
+        // the DELETE policy. Reject missing or unexpected results before schema work.
+        guard try query("PRAGMA journal_mode = DELETE") == [["delete"]] else {
+            throw JournalStorageError(kind: .sqlite, message: "SQLite journal_mode policy requires DELETE")
+        }
         // DELETE commits need the directory sync after unlinking the rollback
         // journal. fullfsync selects a sync method, not this additional sync point.
         try execute("PRAGMA synchronous = EXTRA")
+        // The synchronous setter returns no rows, so check it separately.
+        guard try query("PRAGMA synchronous") == [["3"]] else {
+            throw JournalStorageError(kind: .sqlite, message: "SQLite synchronous policy requires EXTRA (3)")
+        }
         try execute("PRAGMA fullfsync = ON")
     }
 
