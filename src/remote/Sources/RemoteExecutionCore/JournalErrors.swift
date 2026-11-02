@@ -39,3 +39,17 @@ public struct JournalTransactionError: Error, LocalizedError, Sendable {
         "Journal transaction failed: \(originalError.localizedDescription). Rollback failed: \(rollbackError.localizedDescription)"
     }
 }
+
+/// COMMIT reported a failure after SQLite left the transaction. The durable
+/// outcome is unknown to this owner, which must close before reopening the journal.
+public struct JournalCommitOutcomeUnknownError: Error, LocalizedError, Sendable {
+    public let originalError: any Error
+
+    public init(originalError: any Error) {
+        self.originalError = originalError
+    }
+
+    public var errorDescription: String? {
+        "Journal COMMIT outcome is unknown: \(originalError.localizedDescription). Close this owner and reopen the journal before reconciliation."
+    }
+}

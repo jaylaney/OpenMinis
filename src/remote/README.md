@@ -57,6 +57,16 @@ configured durability policy and ordinary persistence, not power-loss behavior;
 genuine power-loss/filesystem qualification remains unperformed. See SQLite's
 [synchronous documentation](https://www.sqlite.org/pragma.html#pragma_synchronous).
 
+Fresh-directory durability is a specific pending qualification case. After
+creating the state leaf, the core does not explicitly synchronize the canonical
+parent directory. SQLite's journal-directory synchronization alone does not
+establish persistence of that parent entry. Qualify a power loss after the first
+acknowledged commit in a newly created leaf, including disappearance of the leaf
+and resulting fresh epoch. The Darwin/filesystem mechanism for synchronizing
+that parent, including directory `F_FULLFSYNC` support and sufficiency, has not
+been qualified. Startup process reconciliation is still required for fresh or
+lost storage, as described below.
+
 `JournalStorageError` is public and exposes a stable `kind` (`alreadyOwned`,
 `sqlite`, `filesystem`, `invalidDirectory`, `invalidState`), diagnostic `message`,
 optional SQLite primary/extended codes and optional POSIX code. Its localized
@@ -64,7 +74,7 @@ message is useful without parsing it to classify errors. SQLite diagnostics are
 captured while the handle is valid. `JournalTransactionError` is a separate
 public composite carrying `originalError` and `rollbackError`; both appear in its
 localized diagnostic, even when the original cause is an `AdmissionError`.
-Automatic SQLite rollback preserves its original cause. `AdmissionError` has
+Automatic SQLite rollback after a transaction-body error preserves its original cause. `AdmissionError` has
 stable short payload-free localized case descriptions. A non-NULL SQLite column
 whose text conversion fails throws its captured storage diagnostic immediately;
 only native SQL NULL maps to an optional nil.
@@ -76,6 +86,18 @@ destroyed and storage reopened. It does not silently reset epochs, release the
 ownership lock, expose uncommitted rows, or downgrade the composite to an ordinary
 admission refusal. Reopening still applies the normal durable-state recovery
 rules; process absence remains a separate host responsibility.
+
+A failed `COMMIT` can report an error after its changes have taken effect. If
+autocommit is enabled after that failure, the outcome is unknown: autocommit
+does not prove rollback, and failed synchronization does not establish power-loss
+durability. `JournalCommitOutcomeUnknownError` retains the `originalError` and
+terminally fences every API, just as a failed rollback does, until destruction
+and reopen. It does not invent a rollback cause or expose a stale cached status.
+The lock remains held while that owner exists. A failed `COMMIT` that leaves the
+transaction active retains the explicit-rollback path; successful rollback
+leaves the owner usable. Reopen applies normal persisted-state recovery, without
+authorizing replay or launch. The regression performs a real native commit and
+then simulates its reported error; it does not inject a real VFS/disk failure.
 
 ## Admission and status
 
@@ -93,7 +115,10 @@ internal to the package, confined to that coordinator.
 initializer. Replacing the connection invalidates the old lease. A rejected
 foreign-controller connect leaves the valid lease intact. Submit and reconcile
 validate the controller, current lease and storage epoch before synchronous
-journal transactions, without an actor suspension between validation and commit.
+journal transactions, without an actor suspension between validation and commit. The
+expected reconciliation epoch is also checked inside its journal transaction,
+before looking up an existing record or writing an absence tombstone, matching
+the transactional epoch fences for admission and settlement.
 
 Each request ID has one durable disposition for its storage epoch. Matching
 retries return that record; changed identity, metadata or payload conflicts are

@@ -23,7 +23,7 @@ private final class SQLiteConnection {
 final class SQLiteDatabase {
     private let handle: SQLiteConnection
     private let native: any SQLiteNative
-    private var terminalFailure: JournalTransactionError?
+    private var terminalFailure: (any Error)?
     private var connection: OpaquePointer { handle.pointer }
 
     init(url: URL, ownershipLock: JournalDirectoryLock? = nil, native: any SQLiteNative = SystemSQLiteNative()) throws {
@@ -90,14 +90,24 @@ final class SQLiteDatabase {
 
     func transaction<T>(_ body: () throws -> T) throws -> T {
         try execute("BEGIN IMMEDIATE")
+        var commitAttempted = false
         do {
             let value = try body()
+            commitAttempted = true
             try execute("COMMIT")
             return value
         } catch {
             let originalError = error
+            let transactionActive = sqlite3_get_autocommit(connection) == 0
+            if commitAttempted && !transactionActive {
+                // Autocommit cannot distinguish committed work from an automatic
+                // rollback after COMMIT failed. Cached state is no longer safe.
+                let failure = JournalCommitOutcomeUnknownError(originalError: originalError)
+                terminalFailure = failure
+                throw failure
+            }
             // SQLITE_FULL and other failures can already have rolled back the transaction.
-            if sqlite3_get_autocommit(connection) == 0 {
+            if transactionActive {
                 do {
                     try execute("ROLLBACK")
                 } catch {
@@ -110,8 +120,8 @@ final class SQLiteDatabase {
         }
     }
 
-    /// A rollback failure abandons this owner, regardless of later autocommit state.
-    /// Retain the original composite until destruction; no operation repairs it.
+    /// A failed rollback or unknown COMMIT outcome abandons this owner.
+    /// Retain the original terminal diagnostic until destruction; no operation repairs it.
     func checkHealth() throws {
         if let terminalFailure { throw terminalFailure }
     }

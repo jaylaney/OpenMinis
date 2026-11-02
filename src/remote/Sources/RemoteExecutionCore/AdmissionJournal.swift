@@ -114,11 +114,12 @@ final class AdmissionJournal {
         }
     }
 
-    func lookupOrRejectAbsent(_ requestID: RequestID, controllerID: ControllerID) throws -> RequestRecord {
+    func lookupOrRejectAbsent(_ requestID: RequestID, epoch: StorageEpoch, controllerID: ControllerID) throws -> RequestRecord {
         try update {
+            guard epoch == (try readEpoch()) else { throw AdmissionError.staleEpoch }
             try validateController(controllerID)
             if let existing = try lookup(requestID) { return existing }
-            let record = RequestRecord(epoch: try readStatus().epoch, controllerID: controllerID,
+            let record = RequestRecord(epoch: epoch, controllerID: controllerID,
                 requestID: requestID, sessionID: nil, runID: nil, kind: nil, digest: nil, disposition: .rejectedAbsent)
             try insert(record)
             return record

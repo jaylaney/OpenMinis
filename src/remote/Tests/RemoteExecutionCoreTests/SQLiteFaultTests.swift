@@ -10,6 +10,7 @@ final class ScriptedSQLiteNative: SQLiteNative, Sendable {
     private struct State {
         var failControllerText = false
         var failCommit = false
+        var commitBeforeFailure = false
         var failRollback = false
         var clearOnRollback = false
         var diagnostic: JournalStorageError?
@@ -32,6 +33,12 @@ final class ScriptedSQLiteNative: SQLiteNative, Sendable {
             $0.clearOnRollback = clearTransaction
         }
     }
+    func failNextCommit(afterRealCommit: Bool) {
+        state.withLock {
+            $0.failCommit = true
+            $0.commitBeforeFailure = afterRealCommit
+        }
+    }
     func columnText(_ statement: OpaquePointer, _ index: Int32) -> UnsafePointer<UInt8>? {
         let sql = String(cString: sqlite3_sql(statement))
         let failed = state.withLock { state in
@@ -48,9 +55,12 @@ final class ScriptedSQLiteNative: SQLiteNative, Sendable {
         let failure: (Bool, Bool) = state.withLock { state in
             if sql == "COMMIT", state.failCommit {
                 state.failCommit = false
-                state.diagnostic = JournalStorageError(kind: .sqlite, message: "Simulated commit I/O failure",
-                                                        sqliteCode: SQLITE_IOERR, sqliteExtendedCode: SQLITE_IOERR)
-                return (true, false)
+                let commitFirst = state.commitBeforeFailure
+                state.commitBeforeFailure = false
+                state.diagnostic = JournalStorageError(kind: .sqlite,
+                    message: commitFirst ? "Simulated reported failure after real COMMIT" : "Simulated commit I/O failure",
+                    sqliteCode: SQLITE_IOERR, sqliteExtendedCode: commitFirst ? 1034 : SQLITE_IOERR) // SQLITE_IOERR_FSYNC
+                return (true, commitFirst)
             }
             if sql == "ROLLBACK", state.failRollback {
                 state.failRollback = false
@@ -61,7 +71,14 @@ final class ScriptedSQLiteNative: SQLiteNative, Sendable {
             return (false, false)
         }
         if failure.0 {
-            if failure.1 { _ = sqlite3_step(statement) }
+            if failure.1 {
+                let result = sqlite3_step(statement)
+                // Do not hide a failure of the real operation behind the simulation.
+                guard result == SQLITE_DONE else {
+                    state.withLock { $0.diagnostic = nil }
+                    return result
+                }
+            }
             return SQLITE_IOERR
         }
         return sqlite3_step(statement)

@@ -44,7 +44,40 @@ final class AdmissionJournalTests: XCTestCase {
             let reopened = try AdmissionJournal(directory: directory, controllerID: controller)
             XCTAssertEqual(try reopened.epoch, mutation.epoch)
             XCTAssertEqual(try reopened.record(mutation).record, accepted)
-            XCTAssertEqual(try reopened.lookupOrRejectAbsent(mutation.requestID, controllerID: mutation.controllerID), accepted)
+            XCTAssertEqual(try reopened.lookupOrRejectAbsent(mutation.requestID, epoch: mutation.epoch, controllerID: mutation.controllerID), accepted)
+        }
+    }
+
+    // Catches stale reconciliation poisoning or exposing the replacement namespace.
+    func testStaleReconciliationCannotCreateReplacementEpochTombstone() throws {
+        try fixture { directory in
+            let journal = try AdmissionJournal(directory: directory, controllerID: controller)
+            let oldEpoch = try journal.epoch
+            let replacementEpoch = try journal.reset()
+            let id = RequestID()
+            assertAdmissionError(.staleEpoch) {
+                _ = try journal.lookupOrRejectAbsent(id, epoch: oldEpoch, controllerID: controller)
+            }
+            let replacement = request(replacementEpoch, id: id)
+            let admitted = try journal.record(replacement)
+            XCTAssertEqual(admitted.record.disposition, .admitted)
+            XCTAssertFalse(admitted.isReplay)
+        }
+    }
+
+    func testStaleReconciliationCannotReadReplacementEpochRecord() throws {
+        try fixture { directory in
+            let journal = try AdmissionJournal(directory: directory, controllerID: controller)
+            let oldEpoch = try journal.epoch
+            let replacementEpoch = try journal.reset()
+            let replacement = request(replacementEpoch)
+            let admitted = try journal.record(replacement)
+            assertAdmissionError(.staleEpoch) {
+                _ = try journal.lookupOrRejectAbsent(replacement.requestID, epoch: oldEpoch, controllerID: controller)
+            }
+            XCTAssertEqual(try journal.lookupOrRejectAbsent(replacement.requestID, epoch: replacementEpoch,
+                                                           controllerID: controller), admitted.record)
+            XCTAssertEqual(try journal.status.activeRun?.runID, replacement.runID)
         }
     }
 
@@ -132,7 +165,7 @@ final class AdmissionJournalTests: XCTestCase {
             XCTAssertTrue(try reopened.recoveryRequired)
             XCTAssertEqual(try reopened.status.activeRun?.state, .stopRequested)
             assertAdmissionError(.wrongController) {
-                _ = try reopened.lookupOrRejectAbsent(RequestID(), controllerID: ControllerID())
+                _ = try reopened.lookupOrRejectAbsent(RequestID(), epoch: first.epoch, controllerID: ControllerID())
             }
             try reopened.confirmRecoveredProcessesAbsent()
             XCTAssertFalse(try reopened.recoveryRequired)
@@ -164,7 +197,7 @@ final class AdmissionJournalTests: XCTestCase {
         try fixture { directory in
             var journal: AdmissionJournal? = try AdmissionJournal(directory: directory, controllerID: controller)
             let mutation = request(try journal!.epoch)
-            let tombstone = try journal!.lookupOrRejectAbsent(mutation.requestID, controllerID: mutation.controllerID)
+            let tombstone = try journal!.lookupOrRejectAbsent(mutation.requestID, epoch: mutation.epoch, controllerID: mutation.controllerID)
             XCTAssertEqual(tombstone.disposition, .rejectedAbsent)
             XCTAssertNil(tombstone.sessionID)
             XCTAssertNil(tombstone.runID)
@@ -211,7 +244,7 @@ final class AdmissionJournalTests: XCTestCase {
         try fixture { directory in
             let journal = try AdmissionJournal(directory: directory, controllerID: controller)
             let old = request(try journal.epoch)
-            _ = try journal.lookupOrRejectAbsent(old.requestID, controllerID: old.controllerID)
+            _ = try journal.lookupOrRejectAbsent(old.requestID, epoch: old.epoch, controllerID: old.controllerID)
             let nextEpoch = try journal.reset()
             XCTAssertNotEqual(nextEpoch, old.epoch)
             assertAdmissionError(.staleEpoch) { _ = try journal.record(old) }
@@ -255,7 +288,7 @@ final class AdmissionJournalTests: XCTestCase {
             let start = request(try journal.epoch)
             _ = try journal.record(start)
             let oldStop = request(start.epoch, session: start.sessionID, run: start.runID, kind: .stopRun)
-            _ = try journal.lookupOrRejectAbsent(oldStop.requestID, controllerID: controller)
+            _ = try journal.lookupOrRejectAbsent(oldStop.requestID, epoch: oldStop.epoch, controllerID: controller)
             let refused = try journal.record(oldStop)
             XCTAssertTrue(refused.isReplay)
             XCTAssertEqual(refused.record.disposition, .rejectedAbsent)

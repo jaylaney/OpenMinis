@@ -73,6 +73,23 @@ final class HostBoundaryAPITests: XCTestCase {
         XCTAssertTrue(composite.localizedDescription.contains("synthetic rollback failure"))
         XCTAssertFalse((composite as any Error) is AdmissionError)
     }
+    // Ordinary importers can classify unknown outcomes and retain SQLite diagnostics.
+    // Constructed error qualifies the public API, not native commit failure behavior.
+    func testPublicUnknownCommitOutcomeRetainsOriginalDiagnostic() {
+        let original = JournalStorageError(kind: .sqlite, message: "synthetic reported COMMIT failure",
+                                          sqliteCode: 10, sqliteExtendedCode: 1034)
+        let error: any Error = JournalCommitOutcomeUnknownError(originalError: original)
+        guard let unknown = error as? JournalCommitOutcomeUnknownError else {
+            return XCTFail("Expected public unknown-outcome classification")
+        }
+        XCTAssertEqual((unknown.originalError as? JournalStorageError)?.sqliteCode, 10)
+        XCTAssertEqual((unknown.originalError as? JournalStorageError)?.sqliteExtendedCode, 1034)
+        XCTAssertTrue(unknown.localizedDescription.lowercased().contains("unknown"))
+        XCTAssertTrue(unknown.localizedDescription.lowercased().contains("reopen"))
+        XCTAssertTrue(unknown.localizedDescription.contains(original.message))
+        XCTAssertFalse(error is JournalTransactionError)
+        XCTAssertFalse(error is AdmissionError)
+    }
     // Status bootstrap needs no known epoch, but all connection reads require the current lease.
     func testReadLeasesFenceReplacementResetAndForeignControllers() async throws {
         try await fixture { leaf in

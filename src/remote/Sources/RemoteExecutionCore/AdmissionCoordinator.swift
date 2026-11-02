@@ -41,7 +41,7 @@ public actor AdmissionCoordinator {
     public func reconcile(requestID: RequestID, epoch: StorageEpoch,
                           over lease: ConnectionLease) throws -> RequestRecord {
         try validate(lease, epoch: epoch)
-        return try journal.lookupOrRejectAbsent(requestID, controllerID: controllerID)
+        return try journal.lookupOrRejectAbsent(requestID, epoch: epoch, controllerID: controllerID)
     }
 
     /// Trusted host-internal snapshot. Use status(over:) for connection reads.
