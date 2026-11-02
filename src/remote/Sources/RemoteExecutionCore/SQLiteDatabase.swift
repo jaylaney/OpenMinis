@@ -1,4 +1,5 @@
 import CSQLite
+import Darwin
 import Foundation
 
 enum SQLiteValue {
@@ -30,8 +31,13 @@ final class SQLiteDatabase {
         self.native = native
         // Cover open failure cleanup as well as successful transfer to the connection.
         defer { withExtendedLifetime(ownershipLock) {} }
+        // Production callers already hold the stable directory lock. Precreate
+        // privately before SQLite opens; EEXIST is left to SQLite's native checks.
+        if let created = try JournalFileCreation.createIfMissing(path: url.path, description: "journal database") {
+            close(created)
+        }
         var opened: OpaquePointer?
-        let result = sqlite3_open_v2(url.path, &opened, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_NOFOLLOW, nil)
+        let result = sqlite3_open_v2(url.path, &opened, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_NOFOLLOW, nil)
         guard result == SQLITE_OK, let opened else {
             let code = opened.map { sqlite3_errcode($0) } ?? result
             let extendedCode = opened.map { sqlite3_extended_errcode($0) } ?? result
@@ -54,6 +60,9 @@ final class SQLiteDatabase {
             throw JournalStorageError(kind: .sqlite, message: "SQLite synchronous policy requires EXTRA (3)")
         }
         try execute("PRAGMA fullfsync = ON")
+        guard try query("PRAGMA fullfsync") == [["1"]] else {
+            throw JournalStorageError(kind: .sqlite, message: "SQLite fullfsync policy requires ON (1)")
+        }
     }
 
     func execute(_ sql: String, _ values: [SQLiteValue] = []) throws {

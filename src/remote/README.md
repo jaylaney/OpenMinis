@@ -48,11 +48,23 @@ descriptor is checked too. Unsafe artifacts are rejected without repair. These
 are cooperative filesystem checks below a stable parent, not hostile same-user
 race isolation.
 
+New lock and main-database files are exclusively created and normalized through
+their new descriptors to mode 0600, preserving owner read/write even when the
+process umask removes those bits. Production code never changes the process
+umask. Main-file creation occurs while the ownership lock is held; SQLite opens
+the prepared file without a fallback to default-permission creation. Existing
+files are opened without normalization: writable 0644 files remain acceptable,
+and existing read-only files require explicit host provisioning rather than
+automatic repair. This is new-file availability handling, not strict artifact
+mode enforcement or a migration policy.
+
 SQLite uses `journal_mode=DELETE`, `synchronous=EXTRA` (native level 3), and
-`fullfsync=ON`. Initialization verifies effective DELETE mode and synchronous
-EXTRA (3) before journal initialization and refuses a missing or unexpected
-result with a structured storage error. The synchronous setter returns no
-row, so its effective value is queried separately. These are defensive policy
+`fullfsync=ON`. Initialization verifies effective DELETE mode, synchronous
+EXTRA (3), and fullfsync ON (1) before journal initialization and refuses a
+missing or unexpected result with a structured storage error. The synchronous
+and fullfsync setters return no row, so their effective values are queried
+separately. A fullfsync readback verifies the requested flag; it does not qualify
+successful native F_FULLFSYNC, hardware flushing or power-loss behavior. These are defensive policy
 checks, not evidence of a reproduced silent WAL-mode failure. EXTRA requests
 the directory synchronization after deleting the
 rollback journal; FULL alone does not request that point, and fullfsync selects

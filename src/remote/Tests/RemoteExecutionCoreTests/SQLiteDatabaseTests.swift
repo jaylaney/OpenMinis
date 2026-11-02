@@ -82,6 +82,70 @@ final class SQLiteDatabaseTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: target), Data())
     }
 
+    // Existing/EEXIST files must remain accepted without privacy migration.
+    func testExisting0644FilesRemainUsableWithoutModeOrInodeChanges() throws {
+        let directory = URL(fileURLWithPath: "/private/tmp/remote-existing-modes-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let controller = ControllerID()
+        let epoch: StorageEpoch
+        do { epoch = try AdmissionJournal(directory: directory, controllerID: controller).epoch }
+        let files = ["admission.lock", "admission.sqlite3"].map { directory.appendingPathComponent($0) }
+        var before: [ino_t] = []
+        for file in files {
+            XCTAssertEqual(chmod(file.path, 0o644), 0)
+            var info = stat()
+            XCTAssertEqual(lstat(file.path, &info), 0)
+            before.append(info.st_ino)
+        }
+        do {
+            let journal = try AdmissionJournal(directory: directory, controllerID: controller)
+            XCTAssertEqual(try journal.epoch, epoch)
+            let record = try journal.lookupOrRejectAbsent(RequestID(), epoch: epoch, controllerID: controller)
+            XCTAssertEqual(record.disposition, .rejectedAbsent)
+        }
+        for (index, file) in files.enumerated() {
+            var info = stat()
+            XCTAssertEqual(lstat(file.path, &info), 0)
+            XCTAssertEqual(info.st_mode & 0o7777, 0o644)
+            XCTAssertEqual(info.st_ino, before[index])
+        }
+    }
+
+    // Normalization must never repair an existing file merely because open failed.
+    func testExistingReadOnlyFilesRefuseWithoutRepairOrReplacement() throws {
+        for name in ["admission.lock", "admission.sqlite3"] {
+            let directory = URL(fileURLWithPath: "/private/tmp/remote-readonly-mode-\(UUID())")
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let controller = ControllerID()
+            do { _ = try AdmissionJournal(directory: directory, controllerID: controller) }
+            let file = directory.appendingPathComponent(name)
+            XCTAssertEqual(chmod(file.path, 0o400), 0)
+            var before = stat()
+            XCTAssertEqual(lstat(file.path, &before), 0)
+            XCTAssertThrowsError(try AdmissionJournal(directory: directory, controllerID: controller))
+            var after = stat()
+            XCTAssertEqual(lstat(file.path, &after), 0)
+            XCTAssertEqual(after.st_mode & 0o7777, 0o400)
+            XCTAssertEqual(after.st_ino, before.st_ino)
+            // Test cleanup restores only this disposable fixture, after assertions.
+            XCTAssertEqual(chmod(file.path, 0o600), 0)
+            let reopened = try AdmissionJournal(directory: directory, controllerID: controller)
+            XCTAssertNil(try reopened.status.activeRun)
+        }
+    }
+
+    func testOwnershipRefusalDoesNotCreateMissingMainDatabase() throws {
+        let directory = URL(fileURLWithPath: "/private/tmp/remote-owned-precreation-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let leaf = try JournalStateDirectory.prepare(directory)
+        let lock = try JournalDirectoryLock(directory: leaf)
+        XCTAssertThrowsError(try AdmissionJournal(directory: leaf, controllerID: ControllerID())) {
+            XCTAssertEqual(($0 as? JournalStorageError)?.kind, .alreadyOwned)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: leaf.appendingPathComponent("admission.sqlite3").path))
+        withExtendedLifetime(lock) {}
+    }
+
     // Foreign-owner acceptance is checked on the stat snapshot, without chowning
     // fixtures or claiming a native foreign-account filesystem experiment.
     func testForeignOwnerArtifactStatIsRejected() throws {

@@ -54,7 +54,7 @@ final class SQLiteStoragePolicyTests: XCTestCase {
         try body(root)
     }
     func testWrongOrMissingEffectiveSettingsRefuseBeforeSchemaAndReleaseOwnership() throws {
-        for (sql, wrong) in [("PRAGMA journal_mode = DELETE", "wal"), ("PRAGMA synchronous", "2")] {
+        for (sql, wrong) in [("PRAGMA journal_mode = DELETE", "wal"), ("PRAGMA synchronous", "2"), ("PRAGMA fullfsync", "0")] {
             for value: String? in [wrong, nil] {
                 try fixture { root in
                     let native = ConfigurationResultNative(sql: sql, value: value)
@@ -76,7 +76,7 @@ final class SQLiteStoragePolicyTests: XCTestCase {
     }
 
     func testConfigurationNativeFailureIsPreservedAndOwnershipReleased() throws {
-        for sql in ["PRAGMA journal_mode = DELETE", "PRAGMA synchronous"] {
+        for sql in ["PRAGMA journal_mode = DELETE", "PRAGMA synchronous", "PRAGMA fullfsync"] {
             try fixture { root in
                 let native = ConfigurationResultNative(sql: sql, value: nil, fail: true)
                 let controller = ControllerID()

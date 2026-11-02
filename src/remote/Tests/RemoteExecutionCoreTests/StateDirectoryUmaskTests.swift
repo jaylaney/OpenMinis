@@ -3,10 +3,11 @@ import Foundation
 import XCTest
 @testable import RemoteExecutionCore
 
+@MainActor
 final class StateDirectoryUmaskTests: XCTestCase {
     // Only exec'd fixture children change umask; the parent runner is untouched.
     func testRestrictiveUmasksCreateUsablePrivateLeafInIsolatedChildren() throws {
-        for mask in ["0177", "0777"] {
+        for mask in ["0177", "0277", "0477", "0677", "0777"] {
             let root = URL(fileURLWithPath: "/private/tmp/openminis-remote-storage-policy-child-\(UUID())")
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false,
                                                     attributes: [.posixPermissions: 0o700])
@@ -32,7 +33,7 @@ final class StateDirectoryUmaskTests: XCTestCase {
         }
     }
 
-    func testUmaskChildFixture() throws {
+    func testUmaskChildFixture() async throws {
         let environment = ProcessInfo.processInfo.environment
         guard let rawMask = environment["OPENMINIS_STORAGE_TEST_MASK"],
               let mask = UInt16(rawMask, radix: 8),
@@ -53,17 +54,43 @@ final class StateDirectoryUmaskTests: XCTestCase {
         let descriptor = open(leaf.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         XCTAssertGreaterThanOrEqual(descriptor, 0)
         if descriptor >= 0 { close(descriptor) }
-        // Qualify the reported mask through the public owner as well. The 0777
-        // case covers directory preparation only; file-mode hardening is deferred.
-        if mask == 0o177 {
-            let controller = ControllerID()
-            do {
-                let owner = try AdmissionCoordinator(directory: leaf, controllerID: controller)
-                withExtendedLifetime(owner) {}
+        // Removing owner-bit normalization strands the lock or main file on reopen.
+        let controller = ControllerID()
+        let epoch: StorageEpoch
+        let mutation: MutationRequest
+        var lockInfo = stat()
+        do {
+            let owner = try AdmissionCoordinator(directory: leaf, controllerID: controller)
+            epoch = try await owner.status().epoch
+            let lease = try await owner.connect(controllerID: controller)
+            mutation = MutationRequest(epoch: epoch, controllerID: controller, requestID: RequestID(),
+                sessionID: SessionID(), runID: RunID(), kind: .startRun, payload: Data([1, 2, 3]))
+            let admitted = try await owner.submit(mutation, over: lease)
+            XCTAssertEqual(admitted.record.disposition, .admitted)
+            try await owner.settle(runID: mutation.runID, epoch: epoch, outcome: .completed)
+            XCTAssertEqual(lstat(leaf.appendingPathComponent("admission.lock").path, &lockInfo), 0)
+            for name in ["admission.lock", "admission.sqlite3"] {
+                XCTAssertEqual(lstat(leaf.appendingPathComponent(name).path, &info), 0)
+                XCTAssertEqual(info.st_mode & 0o7777, 0o600)
             }
-            let reopened = try AdmissionCoordinator(directory: leaf, controllerID: controller)
-            withExtendedLifetime(reopened) {}
         }
+        let reopened = try AdmissionCoordinator(directory: leaf, controllerID: controller)
+        let reopenedStatus = try await reopened.status()
+        XCTAssertEqual(reopenedStatus.epoch, epoch)
+        XCTAssertFalse(reopenedStatus.recoveryRequired)
+        XCTAssertNil(reopenedStatus.activeRun)
+        let settled = try await reopened.runStatus(for: mutation.runID, epoch: epoch)
+        XCTAssertEqual(settled?.outcome, .completed)
+        let lease = try await reopened.connect(controllerID: controller)
+        let replay = try await reopened.submit(mutation, over: lease)
+        XCTAssertTrue(replay.isReplay)
+        let next = MutationRequest(epoch: epoch, controllerID: controller, requestID: RequestID(),
+            sessionID: SessionID(), runID: RunID(), kind: .startRun, payload: Data([4, 5, 6]))
+        let nextAdmission = try await reopened.submit(next, over: lease)
+        XCTAssertEqual(nextAdmission.record.disposition, .admitted)
+        try await reopened.settle(runID: next.runID, epoch: epoch, outcome: .completed)
+        XCTAssertEqual(lstat(leaf.appendingPathComponent("admission.lock").path, &info), 0)
+        XCTAssertEqual(info.st_ino, lockInfo.st_ino)
         XCTAssertThrowsError(try JournalStateDirectory.prepare(restrictive))
         XCTAssertEqual(lstat(restrictive.path, &info), 0)
         XCTAssertEqual(info.st_mode & 0o7777, 0o500)
