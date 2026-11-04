@@ -17,6 +17,7 @@ final class AdmissionJournal {
     init(directory: URL, controllerID: ControllerID, native: any SQLiteNative = SystemSQLiteNative()) throws {
         let preparedDirectory = try JournalStateDirectory.prepare(directory)
         let ownershipLock = try JournalDirectoryLock(directory: preparedDirectory)
+        try StatusStorePreflight.refuseStatusNamespaceForLegacy(directory: preparedDirectory)
         database = try SQLiteDatabase(url: preparedDirectory.appendingPathComponent("admission.sqlite3"), ownershipLock: ownershipLock, native: native)
         // A temporary initialization value is replaced by persisted state before init returns.
         cachedStatus = AdmissionStatus(epoch: StorageEpoch(), recoveryRequired: false, activeRun: nil)

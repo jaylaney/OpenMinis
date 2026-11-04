@@ -1,8 +1,54 @@
-# RemoteExecutionCore
+# RemoteExecutionCore and authenticated-status prototype
 
-A Swift 6 package for local, durable remote-execution admission decisions and
-reconnect reconciliation, backed by real SQLite. There is no runnable host and
-no production app integration in this increment.
+This Swift 6 package contains the legacy SQLite admission foundation and a
+separate status-only profile with standalone Mac host and iPhone probe targets.
+The prototype supports enrollment, pinned TLS, authenticated status, reconnect
+and local revocation. Commands are permanently unsupported by this profile;
+there is no helper, Stop, provider, sync or production app integration.
+
+See the [approved status contract](../../docs/superpowers/specs/2026-11-02-remote-execution-prototype-design.md),
+[implementation plan](../../docs/superpowers/plans/2026-11-02-remote-execution-prototype.md)
+and [qualification record and physical manifest template](prototype/QUALIFICATION.md).
+The standalone project is `prototype/RemoteExecutionPrototype.xcodeproj`, with
+`RemoteHostPrototype` and `RemoteControllerProbe` schemes. Building these targets
+is separate from signing, launching, installing or physical qualification.
+
+The root manifest uses Swift tools 6.0 and Swift 6 language mode, with macOS 13
+and iOS 16 deployment floors. The exact dependency graph requires tools 6.1
+(swift-certificates 1.17.0, swift-crypto 4.5.2, swift-asn1 1.7.4); current
+qualification uses installed Swift 6.4.2, not a Swift 6.0 compiler claim.
+
+## Status-only profile
+
+`StatusOnlyHost.open` submits initialization and all owner work to one dedicated
+serial queue, validates identity against the committed store, and publishes
+handles only after backup-exclusion readback. Transport depends only on Wire;
+the phone adds its controller model and system frameworks, excluding Core, Host
+and Certificates/X509. Source and unsigned link evidence do not establish
+physical runtime or signed Keychain acceptance.
+
+Status uses its own installation leaf, the stable `admission.lock`, and the same
+`admission.sqlite3` filename under a mutually exclusive open profile. Only fresh
+or validated clean rollback-format OMST v1 stores are accepted. Every recovery
+companion, including an empty rollback journal, is refused untouched; the narrowly
+validated `.DS_Store` exception is metadata only. A crash journal can therefore
+block reopen. Keep the store and lock for diagnosis: there is no migration,
+reset, deletion, recovery or automatic fresh-installation workaround. A legacy
+opener refuses OMST before writable open; legacy behavior otherwise remains
+unchanged.
+
+The controller has one outstanding request and the host dispatches serially.
+Observable same-read pipelining and response preemption close the connection;
+frozen wire v1 cannot universally detect peer-send timing across separate native
+receives. This is not an arbitrary malicious-peer timing guarantee. Public
+comparison diagnostics are redacted. Host presentation automatically refreshes
+while an invitation or candidate is visible, using owner policy rather than a
+second UI expiry deadline.
+
+The status profile adds native TLS, enrollment, Keychain adapters, async ownership,
+backup gating and prototype UI. The remaining sections describe the **legacy
+admission profile** and its integration obligations. Their deferred transport,
+backup and executor statements apply to that profile.
 
 Run the package tests from the repository root:
 
@@ -11,8 +57,11 @@ swift test --package-path src/remote --scratch-path /private/tmp/openminis-remot
 ```
 
 The fixtures use unique temporary directories and opaque synthetic payloads.
-They exercise SQLite persistence, delayed delivery, leases and recovery without
-network peers or user databases. ACL fixture setup invokes system chmod only
+Legacy fixtures exercise SQLite persistence, delayed delivery, leases and recovery
+without network peers or user databases. Status fixtures additionally exercise
+disposable native TLS loopback with ephemeral identities; injected Keychain and
+address-policy tests do not access real paired devices or Keychain items.
+ACL fixture setup invokes system chmod only
 within disposable temporary directories; it does not qualify managed command
 execution or process supervision. The internal instance-owned `SQLiteNative`
 boundary defaults to real SQLite. Fault fixtures simulate selected native
@@ -217,8 +266,8 @@ also applies to fresh, lost or empty storage when `recoveryRequired` is false:
 a new epoch and an empty journal cannot prove that no process survived.
 
 Before service begins, the host must mark its state directory excluded from
-backup and verify that policy. This package does not set that filesystem
-attribute. Restore exclusion and fresh-epoch behavior still require native
+backup and verify that policy. The legacy admission profile does not set that filesystem
+attribute; the status profile gates readiness on its application and readback. Restore exclusion and fresh-epoch behavior still require native
 qualification; backup restoration cannot be treated as already safe.
 
 Pre-production host gates also include local controller replacement/revocation
@@ -227,9 +276,12 @@ per-run controller ownership; and schema version/migration planning. This packag
 has a persistent single-controller binding, not an enrollment/revocation API or
 a schema migration. Deleting the database is not a controller replacement
 procedure. Its synchronous SQLite work also needs dedicated-executor performance
-qualification before host integration; no dedicated executor is implemented here.
+qualification before host integration; no dedicated executor is implemented for the legacy profile. The status profile
+has a dedicated serial owner queue.
 
-Native TLS and authenticated transport, Tailscale integration, enrollment/key
-management, process supervision, UI and notifications remain later gate 1 work.
-The package and its automated tests do not establish native or physical-device
-qualification. Gate 2 production extraction remains pending that qualification.
+The status profile implements native TLS, authenticated transport, enrollment/key
+management and standalone UI. External Tailscale configuration, signed Keychain
+and physical-device qualification remain separate. Process supervision, commands
+and parent execution gates B1–B7 remain deferred; status work advances only bounded
+parts of issues #2–#4 and does not close them. Issues #5/#6 remain open. Gate 2
+production extraction remains pending the parent design and qualification gates.

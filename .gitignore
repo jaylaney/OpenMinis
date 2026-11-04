@@ -63,6 +63,9 @@ Podfile.lock
 .build/
 .swiftpm/
 Package.resolved
+# Pin the standalone remote prototype dependency graph.
+!src/remote/Package.resolved
+!src/remote/prototype/RemoteExecutionPrototype.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
 
 # macOS
 .DS_Store
