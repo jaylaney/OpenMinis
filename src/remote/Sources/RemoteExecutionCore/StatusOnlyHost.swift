@@ -52,7 +52,7 @@ public struct TrustedStatusHostHandle: Sendable {
         try await owner.perform { try $0.acceptCandidate(contextID: contextID, claimDigest: claimDigest) }
     }
 
-    public func confirmCandidate(candidateID: UUID) async throws {
+    @discardableResult public func confirmCandidate(candidateID: UUID) async throws -> StatusOnlySnapshot {
         try await owner.perform { try $0.confirmCandidate(candidateID: candidateID) }
     }
 

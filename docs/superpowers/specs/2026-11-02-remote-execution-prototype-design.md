@@ -1,8 +1,8 @@
 # Authenticated-status prototype
 
 Date: 2026-11-02
-Revision: 2 — 2026-11-03 review corrections; documentation only.
-Status: Revised scope selected by the user; documentation only. Review this contract and its plan before implementation.
+Revision: 3 — 2026-11-04 approved PR #7 lifecycle and confirmation corrections.
+Status: Gate A implementation is on PR #7. The user authorized the four confirmed review fixes on 2026-11-04; signed/physical and execution gates remain separate.
 Baseline: fork `main` at `fcb9bb8f57cfd7241c01e22bdd87769f91364e7d` (merged admission foundation).
 Parent: [remote execution design, revision 12](2026-10-30-remote-execution-design.md).
 
@@ -19,6 +19,17 @@ The user selected a smaller status-only increment after review of the broader sc
 | Fresh state on every launch | Simplest opening path, but cannot establish persistent enrollment/revocation or normal reconnect across launches. | Rejected. |
 
 Implementation defaults below are author choices implementing that selection. They are frozen for the proposed plan, not claims of tested native behavior. The original review remains historical evidence; this document supersedes the earlier scripted-prototype proposal at this path.
+
+## Approved PR #7 corrections
+
+The 2026-11-04 correction request covers four behavior issues:
+
+- An explicit local-policy load can open an existing committed status installation without activating networking or invoking TLS credential/certificate/listener setup. It uses the same serial Core owner, lock, validation and required identity checks. It refuses fresh/missing/zero-byte stores without creating a policy, epoch, identity, state leaf or main file. Explicit Enable retains the original fresh-store behavior. Loading is a user action, never launch/onChange/poll behavior; it does not automatically reopen a retained failed owner.
+- Owner lifetime is independent from hosting readiness. A retained owner, including after revocation or failure, remains explicitly closeable. Revocation is available for an enrolled locally loaded slot even while hosting is disabled. Close/disable/Quit cancel first and close the owner; failure does not silently release/reopen it.
+- Trusted confirmation returns its committed snapshot only after successful COMMIT. The bridge reports a committed result independently of whether its EnrollmentCommitted send completed. A late disconnect/send failure cannot relabel a committed enrollment as failed. Genuine storage/unknown-commit failures still propagate and fence; a subsequent readiness failure stays visible alongside an already-known committed outcome. No retry/replay is introduced.
+- Open enrollment is disabled for every non-closed owner enrollment phase, including a fixed candidate awaiting CandidateAccepted send completion. Core remains the authority; candidate publication still occurs only after send completion. Polling reads the owner phase without creating another expiry clock.
+
+The [focused fix plan](../plans/2026-11-04-remote-status-pr7-fixes.md) implements these corrections. The other PR comments are deferred or disputed as assessed; no wire, routing, recovery or optional cleanup redesign is included.
 
 ## Requirements and boundaries
 
@@ -106,6 +117,7 @@ StatusOnlyHost.open(configuration: StatusOnlyHostConfiguration) async throws -> 
 // configuration: directory URL; injected monotonic clock/random source;
 // onUnavailable: @Sendable () -> Void (disable/close only, never reenter Core);
 // identity resolver(requiredPin: Data?) throws -> Data (resolved public SPKI).
+// allowsFreshStore: Bool = true; false refuses fresh input before identity/DB creation.
 // nil is supplied only for owner-established fresh state; existing identity must match.
 
 StatusOnlyHostHandles.host: TrustedStatusHostHandle
@@ -116,7 +128,7 @@ TrustedStatusHostHandle.openEnrollment() async throws -> StatusEnrollmentWindow
 TrustedStatusHostHandle.beginHandshake(_ input: StatusHandshakeInput) async throws -> StatusHandshakeContext
 TrustedStatusHostHandle.recordProofFailure(contextID: UUID) async throws
 TrustedStatusHostHandle.acceptCandidate(contextID: UUID, claimDigest: Data) async throws -> StatusAcceptedCandidate
-TrustedStatusHostHandle.confirmCandidate(candidateID: UUID) async throws
+TrustedStatusHostHandle.confirmCandidate(candidateID: UUID) async throws -> StatusOnlySnapshot
 TrustedStatusHostHandle.rejectCandidate(candidateID: UUID) async throws
 TrustedStatusHostHandle.authenticate(contextID: UUID) async throws -> StatusControllerLease
 TrustedStatusHostHandle.disconnect(connectionID: UUID) async

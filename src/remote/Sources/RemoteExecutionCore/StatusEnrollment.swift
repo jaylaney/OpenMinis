@@ -205,11 +205,12 @@ extension StatusOnlyOwner.State {
         }
     }
 
-    func confirmCandidate(candidateID: UUID) throws {
+    func confirmCandidate(candidateID: UUID) throws -> StatusOnlySnapshot {
         expireEnrollment()
         guard let claim = fixedEnrollmentClaim, enrollmentCandidate?.candidateID == candidateID,
               claim.candidateID == candidateID else { throw StatusHostError.invalidCandidate }
-        _ = try requireJournal().confirm(key: claim.controllerSPKI)
+        let committed = try requireJournal().confirm(key: claim.controllerSPKI).snapshot
         clearEnrollment()
+        return committed
     }
 }

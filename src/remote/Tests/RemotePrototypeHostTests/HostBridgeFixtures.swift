@@ -14,6 +14,7 @@ final class BridgeBox<T>: @unchecked Sendable {
     init(_ value: T) { self.value = value }
     func get() -> T { lock.withLock { value } }
     func set(_ value: T) { lock.withLock { self.value = value } }
+    func update(_ body: (inout T) -> Void) { lock.withLock { body(&value) } }
     func swap(_ value: T) -> T { lock.withLock { let old = self.value; self.value = value; return old } }
 }
 struct BridgeClock: StatusClock { let now = BridgeBox(StatusTLSClock.nowNanoseconds()); func nowNanoseconds() -> UInt64 { now.get() } }
@@ -28,13 +29,15 @@ final class BridgeChangingRandom: StatusRandomSource, Sendable {
 struct BridgeBackup: StatusBackupExclusion { func applyAndVerify(_ directory: URL) throws {} }
 final class BridgeNative: SQLiteNative, @unchecked Sendable {
     let unknownCommit = BridgeBox(false)
+    let failNextCommit = BridgeBox(false)
     let failNextRead = BridgeBox(false)
     let onStep = BridgeBox<(@Sendable (String) -> Void)?>(nil)
     func step(_ s: OpaquePointer) -> Int32 {
         let sql = String(cString: sqlite3_sql(s))
         onStep.get()?(sql)
         if sql.hasPrefix("SELECT"), failNextRead.swap(false) { return SQLITE_IOERR }
-        if String(cString: sqlite3_sql(s)) == "COMMIT", unknownCommit.get() {
+        if sql == "COMMIT", failNextCommit.swap(false) { return SQLITE_IOERR }
+        if sql == "COMMIT", unknownCommit.get() {
             unknownCommit.set(false); _ = sqlite3_step(s); return SQLITE_IOERR
         }
         return sqlite3_step(s)
@@ -44,7 +47,13 @@ final class BridgeNative: SQLiteNative, @unchecked Sendable {
 final class BridgeListener: HostListener, @unchecked Sendable {
     let acceptBlock = BridgeBox<(@Sendable (StatusTLSChannel) -> Void)?>(nil)
     let availability = BridgeBox<(@Sendable (Bool) -> Void)?>(nil)
-    func start() async throws -> UInt16 { availability.get()?(true); return 49152 }
+    let startGate = BridgeBox<BridgeAsyncGate?>(nil)
+    let failStart = BridgeBox(false)
+    func start() async throws -> UInt16 {
+        await startGate.get()?.arriveIfHeld()
+        if failStart.get() { throw HostBridgeError.unavailable }
+        availability.get()?(true); return 49152
+    }
     func cancel() { availability.get()?(false) }
     func accept(_ c: StatusTLSChannel) { acceptBlock.get()?(c) }
 }
@@ -59,7 +68,7 @@ struct HostFixture: @unchecked Sendable {
     let queue: DispatchQueue
     let key: SecKey
     let spki: Data
-    static func open(gate: BridgeAsyncGate? = nil, random: any StatusRandomSource = BridgeRandom()) async throws -> Self {
+    static func open(gate: BridgeAsyncGate? = nil, openCompletionGate: BridgeAsyncGate? = nil, random: any StatusRandomSource = BridgeRandom(), onChange: @escaping @Sendable () -> Void = {}) async throws -> Self {
         let key = try makeKey(2), hostKey = try makeKey(1)
         let spki = try publicSPKI(hostKey)
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("host-bridge-\(UUID())")
@@ -71,8 +80,10 @@ struct HostFixture: @unchecked Sendable {
             makeListener: { _, _, accept, availability in listener.acceptBlock.set(accept); listener.availability.set(availability); return listener },
             openOwner: { config in
                 await gate?.arriveIfHeld()
-                return try await StatusOnlyHost.open(configuration: config, native: native, backupExclusion: BridgeBackup(), queue: queue)
-            }))
+                let opened = try await StatusOnlyHost.open(configuration: config, native: native, backupExclusion: BridgeBackup(), queue: queue)
+                await openCompletionGate?.arriveIfHeld()
+                return opened
+            }), onChange: onChange)
         let endpoint = try StatusEndpoint(ipv4: "100.64.0.1", port: 49152)
         try await service.enable(configuration: config, endpoint: endpoint)
         return Self(service: service, listener: listener, configuration: config, endpoint: endpoint, directory: directory, clock: clock, native: native, queue: queue, key: key, spki: spki)

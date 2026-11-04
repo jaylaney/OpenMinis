@@ -31,13 +31,14 @@ private final class HostRuntime: @unchecked Sendable {
     let fence = ServiceFence()
     let pump = ConnectionPump(role: .host)
     let onChange: @Sendable () -> Void
+    let directory: URL
     private let lock = NSLock()
     private var listener: (any HostListener)?
     private var dispatcher: HostRPCDispatcher?
     private var listening = false
     private var identity: Data?
-    init(onChange: @escaping @Sendable () -> Void) {
-        self.onChange = onChange
+    init(directory: URL, onChange: @escaping @Sendable () -> Void) {
+        self.directory = directory; self.onChange = onChange
         fence.onDisable { [weak self] in self?.cancelResources() }
     }
     func recordIdentity(_ identity: Data) { lock.withLock { self.identity = identity } }
@@ -98,21 +99,55 @@ public actor HostService {
     init(dependencies: HostDependencies, onChange: @escaping @Sendable () -> Void = {}) {
         self.dependencies = dependencies; self.onChange = onChange
     }
-    public func enable(configuration: StatusOnlyHostConfiguration, endpoint: StatusEndpoint) async throws {
-        let oldRuntime = runtime, oldHandles = handles
-        let next = HostRuntime(onChange: onChange)
-        runtime = next; handles = nil; dispatcher = nil
-        oldRuntime?.fence.disable()
-        if let oldHandles { await oldHandles.host.close() }
-        guard runtime === next, !next.fence.isDisabled else { throw HostBridgeError.disabled }
-        let wrapped = StatusOnlyHostConfiguration(directory: configuration.directory, clock: configuration.clock,
+    public func openLocalPolicy(configuration: StatusOnlyHostConfiguration) async throws {
+        if handles != nil {
+            // A different selection requires explicit Close; never present A as B.
+            guard runtime?.directory.absoluteString == configuration.directory.absoluteString else { throw HostBridgeError.unavailable }
+            // This read preserves a retained failure; never replace its owner.
+            _ = try await localStatus()
+            return
+        }
+        guard runtime == nil else { throw HostBridgeError.disabled }
+        let next = HostRuntime(directory: configuration.directory, onChange: onChange)
+        runtime = next
+        let wrapped = wrappedConfiguration(configuration, runtime: next, allowsFreshStore: false)
+        var opened: StatusOnlyHostHandles?
+        do {
+            let owner = try await dependencies.openOwner(wrapped)
+            opened = owner
+            guard runtime === next, !next.fence.isDisabled else { throw HostBridgeError.disabled }
+            handles = owner
+            onChange()
+        } catch {
+            next.fence.disable()
+            if let opened { await opened.host.close() }
+            if runtime === next { runtime = nil; handles = nil; dispatcher = nil }
+            throw error
+        }
+    }
+    private func wrappedConfiguration(_ configuration: StatusOnlyHostConfiguration, runtime next: HostRuntime,
+                                      allowsFreshStore: Bool) -> StatusOnlyHostConfiguration {
+        StatusOnlyHostConfiguration(directory: configuration.directory, clock: configuration.clock,
             random: configuration.random, identityResolver: { [weak next] required in
                 let spki = try configuration.identityResolver(required)
                 next?.recordIdentity(spki); return spki
             }, onUnavailable: { [weak next] in
                 next?.fence.disable()
                 configuration.onUnavailable()
-            })
+            }, allowsFreshStore: allowsFreshStore)
+    }
+    public func enable(configuration: StatusOnlyHostConfiguration, endpoint: StatusEndpoint) async throws {
+        if handles != nil {
+            // Explicit network activation cannot silently reopen a failed owner.
+            _ = try await localStatus()
+        }
+        let oldRuntime = runtime, oldHandles = handles
+        let next = HostRuntime(directory: configuration.directory, onChange: onChange)
+        runtime = next; handles = nil; dispatcher = nil
+        oldRuntime?.fence.disable()
+        if let oldHandles { await oldHandles.host.close() }
+        guard runtime === next, !next.fence.isDisabled else { throw HostBridgeError.disabled }
+        let wrapped = wrappedConfiguration(configuration, runtime: next, allowsFreshStore: configuration.allowsFreshStore)
         var opened: StatusOnlyHostHandles?
         do {
             let owner = try await dependencies.openOwner(wrapped)
@@ -135,9 +170,16 @@ public actor HostService {
             onChange()
         } catch {
             next.fence.disable()
+            if runtime === next, handles != nil {
+                // Published owners outlive network startup. In particular, keep
+                // Core's original retained failure and lock until explicit Close.
+                onChange()
+                throw error
+            }
+            // Unpublished or superseded results own only their partial resources.
             if let opened { await opened.host.close() }
             // A superseded enable cannot erase a fresh runtime or handles.
-            if runtime === next { handles = nil; dispatcher = nil }
+            if runtime === next { runtime = nil; handles = nil; dispatcher = nil }
             throw error
         }
     }
@@ -169,24 +211,24 @@ public actor HostService {
         guard let dispatcher else { throw HostBridgeError.disabled }
         return try await dispatcher.openEnrollment()
     }
-    public func confirmCandidate(candidateID: UUID) async throws {
+    @discardableResult public func confirmCandidate(candidateID: UUID) async throws -> HostConfirmationOutcome {
         guard let dispatcher else { throw HostBridgeError.disabled }
-        try await dispatcher.confirmCandidate(candidateID: candidateID)
+        return try await dispatcher.confirmCandidate(candidateID: candidateID)
     }
     public func rejectCandidate(candidateID: UUID) async throws {
         guard let dispatcher else { throw HostBridgeError.disabled }
         try await dispatcher.rejectCandidate(candidateID: candidateID)
     }
     public func presentation() async -> HostPresentation {
-        guard let runtime, !runtime.fence.isDisabled, let dispatcher else { return HostPresentation(isEnabled: false, isListening: false, invitation: nil, candidate: nil) }
+        guard let runtime, !runtime.fence.isDisabled, let dispatcher else { return HostPresentation(isEnabled: false, isListening: false, invitation: nil, candidate: nil, hasOpenOwner: handles != nil) }
         let result = await dispatcher.presentation(listening: runtime.isListening)
         guard self.runtime === runtime, !runtime.fence.isDisabled else {
-            return HostPresentation(isEnabled: false, isListening: false, invitation: nil, candidate: nil)
+            return HostPresentation(isEnabled: false, isListening: false, invitation: nil, candidate: nil, hasOpenOwner: handles != nil)
         }
         // Availability may change during the Core refresh. Sample it only after
         // the awaited result is known to belong to this still-enabled runtime.
         return HostPresentation(isEnabled: result.isEnabled, isListening: runtime.isListening,
-                                invitation: result.invitation, candidate: result.candidate)
+                                invitation: result.invitation, candidate: result.candidate, hasOpenOwner: true, enrollment: result.enrollment)
     }
     public static func makeProductionConfiguration(directory: URL, onUnavailable: @escaping @Sendable () -> Void = {}) -> StatusOnlyHostConfiguration {
         StatusOnlyHostConfiguration(directory: directory, clock: HostClock(), random: HostRandom(), identityResolver: { requiredPin in

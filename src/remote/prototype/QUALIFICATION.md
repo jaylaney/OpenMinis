@@ -12,11 +12,11 @@ separate. This increment addresses bounded parts of issues #2–#4; work for
 Baseline: `fcb9bb8f57cfd7241c01e22bdd87769f91364e7d`. The integrated implementation
 is identified by the source fingerprint below; the baseline is not its artifact
 revision. Final source fingerprint:
-`c254ab7878d0ca85c977e1cbf30e85922eed07c1eeb149c4d0a2932fa14841af`
+`bef8f9f29bedc052d83792bf6a9871bdafe9ff74626d8dc5a83e43287a6b14dd`
 (76 source/test/project/pin/root-ignore files; excludes documentation, caches and
-user state; `/private/tmp/openminis-status-post-expiry-source-manifest.json`). Earlier Task 12 177-case/build and Task 13 181-case/build reports are
-historical: they precede later fixes. Current evidence includes the final idle
-invitation-expiry presentation fix; earlier logs/manifests are retained. No fixture, source graph or unsigned build establishes
+user state; `/private/tmp/openminis-pr7-r1-final-source-manifest.json`). Earlier 177-, 181-, 186- and 197-case/build reports are
+historical. Current evidence covers the approved PR #7 local-policy/lifecycle,
+confirmation-outcome and enrollment-phase fixes; earlier records are retained. No fixture, source graph or unsigned build establishes
 signed deployment, physical readiness or power-loss durability.
 
 | Class | Meaning |
@@ -42,18 +42,20 @@ git diff --check
 
 | Evidence | Revision | Result | Class / record |
 | --- | --- | --- | --- |
-| Full unfiltered command above | Final fingerprint | PASS, exit 0 | Automated; `/private/tmp/openminis-status-post-expiry-tests.log` |
-| Mac command above | Same | PASS, exit 0, BUILD SUCCEEDED | Unsigned artifact; `/private/tmp/openminis-status-post-expiry-mac-build.log` |
-| iOS command above | Same | PASS, exit 0, BUILD SUCCEEDED | Unsigned artifact; `/private/tmp/openminis-status-post-expiry-ios-build.log` |
+| Full unfiltered command above | Final fingerprint | PASS, exit 0 | Automated; `/private/tmp/openminis-pr7-r1-full-tests.log` |
+| Mac command above | Same | PASS, exit 0, BUILD SUCCEEDED | Unsigned artifact; `/private/tmp/openminis-pr7-r1-mac-build.log` |
+| iOS command above | Same | PASS, exit 0, BUILD SUCCEEDED | Unsigned artifact; `/private/tmp/openminis-pr7-r1-ios-build.log` |
 | `git diff --check` | Final source and documentation | PASS, exit 0 after final doc update | Source hygiene; primary-owned |
 | Fresh whole-branch review, baseline → pre-expiry-fix working tree | `cf96268b…` | PASS with one Minor M1, zero Critical/Important | Review; `/private/tmp/openminis-status-final-whole-branch-review.md` |
-| Independent scoped M1 fix re-review | Current `c254ab78…` | PASS; M1 addressed, no introduced finding | Review; `/private/tmp/openminis-status-final-fix-rereview.md` |
+| Independent scoped M1 fix re-review | Historical `c254ab78…` | PASS; M1 addressed, no introduced finding | Review; `/private/tmp/openminis-status-final-fix-rereview.md` |
+| Fresh whole-branch PR #7 fix review | Historical `9061791a…` | One Important I1; changes required | Review; `/private/tmp/openminis-pr7-fixes-whole-branch-review.md` |
+| Independent scoped I1 correction re-review | Current `bef8f9f2…` | PASS; I1 addressed, no introduced finding | Review; `/private/tmp/openminis-pr7-r1-rereview.md` |
 
-The fresh primary run reports **186 XCTest cases, zero failures, one expected
+The fresh primary run reports **202 XCTest cases, zero failures, one expected
 parent-only `StateDirectoryUmaskTests.testUmaskChildFixture` skip**. The original
-69 legacy cases remain, plus 117 new cases. Suite totals: Core 83, public API 20,
-Wire 7, Transport 32 (including 9 native TLS and 13 pump cases), Host 19,
-Certificates 2, HostModel 10, Probe 13. All native TLS tests executed; no compiler
+69 legacy cases remain, plus 133 new cases. Suite totals: Core 85, public API 20,
+Wire 7, Transport 32 (including 9 native TLS and 13 pump cases), Host 28,
+Certificates 2, HostModel 15, Probe 13. All native TLS tests executed; no compiler
 warnings/errors. The Mac build has only the known no-AppIntents metadata warning; the
 incremental iOS build has no warnings. No skipped gate counts as passing.
 
@@ -91,8 +93,37 @@ fenced. Five new regressions include real-Core expiry and lifecycle coverage.
 The full review covered the earlier snapshot; the scoped fix review covers only
 this subsequent change and found M1 addressed with no introduced Critical,
 Important or Minor finding. No second whole-branch review of the current hash
-is claimed. Gate A automated/unsigned verification and this review chain pass;
-signed/physical acceptance remains separate.
+is claimed. That earlier review chain passed for its historical snapshots. The fresh PR #7
+whole-branch review found I1; its correction passed independent scoped re-review
+at the current fingerprint. Current automated/unsigned verification also passes.
+No second whole-branch review at the current hash is claimed. Signed/physical
+acceptance remains separate.
+
+The approved PR #7 corrections use the same owner and schema. Explicit local
+policy load is existing-only, validates the retained host identity, and invokes
+no transport credential/certificate/listener setup. Missing/zero-byte input
+cannot create a policy, epoch, identity, state leaf or main file. A retained
+failed owner requires explicit Close; local refresh/Enable cannot silently
+replace it. Storage failure while listener startup is awaiting completion obeys
+the same rule. A healthy network-start failure leaves local policy readable. A local-policy load for a different selected directory is refused until Close. Owner
+presence remains visible independently from network readiness.
+
+| Correction | Named regression in the full run | Evidence class |
+| --- | --- | --- |
+| Offline policy/revoke | `StatusSchemaTests.testExistingOnlyOpenRefusesFreshWithoutCreation`, `testExistingOnlyOpenLoadsEnrolledPolicy`; `HostBridgeTests.testOfflineExistingPolicyLoadAndRevokeWithoutTransportSetup` | Disposable filesystem/real Core, injected transport-call spies |
+| Retained owner Close | `HostBridgeTests.testStorageReadFailureDisablesAndRetainsOwner`, `testCloseDuringLocalPolicyOpenDiscardsLateOwner`; `HostModelTests.testExplicitLocalLoadAllowsOfflineRevokeAndClose` | Real Core/lock with injected failure/open barriers; model fixture |
+| Commit/delivery separation | `HostBridgeTests.testLostCommitAckUsesNormalAuth`, `testCommittedConfirmationSurvivesCloseDuringHeldCommit`, `testConfirmationUsesCommittedSnapshotAndLaterReadinessFailureRemainsError`, `testConfirmationCommitFailureAndUnknownOutcomeStayErrors`; `HostModelTests.testCommittedNoticeSurvivesReadinessFailure` | Real transactions with selected native result/send/queue faults injected |
+| Full owner enrollment phase | `HostModelTests.testEnrollmentGateUsesOwnerPhaseIncludingHeldCandidateSend`; `HostBridgeTests.testCandidatePublicationWaitsForSendCompletion` | Owner-backed bridge plus controlled model/send fixtures |
+| Selected installation | `HostBridgeTests.testLocalPolicyLoadRefusesDifferentSelectedDirectoryUntilClose` | Two real disposable stores/locks with distinct epochs |
+| Startup owner retention | `HostBridgeTests.testPublishedOwnerFailureDuringListenerStartRemainsUntilClose`, `testCloseDuringHeldListenerStartCannotRetainOrReviveOwner`; `HostModelTests.testEnableErrorRefreshesRetainedOwnerAndReadiness`, `testCloseDiscardsHeldEnableErrorResourceRefresh` | Held listener startup, real Core/error/lock, injected external IO and model barriers |
+
+Confirmation returns the known committed snapshot after COMMIT. A subsequent
+lost connection/send reports uncertain acknowledgement delivery rather than a
+failed enrollment. Core/unknown-commit failures stay errors/fenced, and a later
+readiness failure remains visible alongside a known committed notice. Native
+send completion does not establish phone receipt or persistence. Owner phase
+keeps Open enrollment disabled during a fixed claim even before its comparison
+is published. Core retains all deadline/authorization decisions.
 
 Queue sentinels establish responsiveness under deterministically blocked owner
 jobs, not a performance benchmark. SQLite DELETE/EXTRA/fullfsync readback and
@@ -165,7 +196,7 @@ SHA-256 of actual final unsigned files (not a complete bundle digest):
 | File relative to its app | SHA-256 |
 | --- | --- |
 | Mac `Contents/MacOS/RemoteHostPrototype` | `069255563a30e618a3424ac5e24939c7a9ebe290fa3bea9ab6010456f0f97637` |
-| Mac `Contents/MacOS/RemoteHostPrototype.debug.dylib` | `4ff68d3a0717915a610550287291adbbeb697267770ac089a3c516e61a59bdcd` |
+| Mac `Contents/MacOS/RemoteHostPrototype.debug.dylib` | `e5abf1c86267f962f9e8eb8a4f3382f46f3254cd7052d0307b8f9ee3ed60396a` |
 | iOS `RemoteControllerProbe` | `86844870e59914a98c7ecac662dfab282cfd5c2f8819541b3894d7fead849256` |
 | iOS `RemoteControllerProbe.debug.dylib` | `eb570169288dac85a25dbffdd4e34415b6a60eed07f2937758f43ed80561fc2e` |
 
@@ -219,6 +250,7 @@ state after refusal. No installation is created or deleted by this record.
 | P8 / A2 | Selected address loss closes listener/channels; only same saved address may rebind | NOT RUN | Signed/physical |
 | P9 / A10 | Actual data-protection Keychain authorization, lock and app/host restart; unavailable keys refuse without replacement | NOT RUN | Signed/physical |
 | P10 / A5,A12 | Inspect actual redacted app/system logs and secret-free public diagnostics | NOT RUN | Signed/physical |
+| P11 / A4,A9–A10 | With network hosting disabled, explicitly load existing local policy, revoke without listener setup, Close/reopen and verify retained revocation and load-only Keychain behavior | NOT RUN | Signed/physical |
 
 Signed/physical acceptance, minimum-OS runtime, sleep/foreground/window behavior,
 backup-restore behavior, power-loss durability and general crash recovery remain

@@ -12,6 +12,7 @@ public protocol StatusRandomSource: Sendable {
 /// after the owner has established freshness. Callbacks run on the owner queue.
 public struct StatusOnlyHostConfiguration: Sendable {
     public let directory: URL
+    public let allowsFreshStore: Bool
     public let clock: any StatusClock
     public let random: any StatusRandomSource
     public let identityResolver: @Sendable (Data?) throws -> Data
@@ -19,8 +20,9 @@ public struct StatusOnlyHostConfiguration: Sendable {
 
     public init(directory: URL, clock: any StatusClock, random: any StatusRandomSource,
                 identityResolver: @escaping @Sendable (Data?) throws -> Data,
-                onUnavailable: @escaping @Sendable () -> Void) {
+                onUnavailable: @escaping @Sendable () -> Void, allowsFreshStore: Bool = true) {
         self.directory = directory
+        self.allowsFreshStore = allowsFreshStore
         self.clock = clock
         self.random = random
         self.identityResolver = identityResolver

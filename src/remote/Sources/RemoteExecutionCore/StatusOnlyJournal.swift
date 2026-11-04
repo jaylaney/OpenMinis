@@ -28,7 +28,7 @@ final class StatusOnlyJournal {
     static func open(configuration: StatusOnlyHostConfiguration,
                      native: any SQLiteNative = SystemSQLiteNative(),
                      backupExclusion: any StatusBackupExclusion = FoundationStatusBackupExclusion()) throws -> StatusOnlyJournal {
-        let directory = try JournalStateDirectory.prepare(configuration.directory)
+        let directory = try JournalStateDirectory.prepare(configuration.directory, createIfMissing: configuration.allowsFreshStore)
         let lock = try JournalDirectoryLock(directory: directory)
         defer { withExtendedLifetime(lock) {} }
         let probe = try StatusStorePreflight.inspectOwned(directory: directory)
@@ -36,6 +36,9 @@ final class StatusOnlyJournal {
         let saved: StatusStoredPolicy?
         let identity: Data
         if probe.isFresh {
+            guard configuration.allowsFreshStore else {
+                throw JournalStorageError(kind: .invalidState, message: "Existing committed status policy is required")
+            }
             saved = nil
             identity = try configuration.identityResolver(nil)
             try StatusSchema.validateSPKI(identity)

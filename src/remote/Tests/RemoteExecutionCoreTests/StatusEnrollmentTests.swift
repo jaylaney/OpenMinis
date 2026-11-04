@@ -33,8 +33,9 @@ final class StatusEnrollmentTests: XCTestCase {
         XCTAssertEqual(pending.enrollment, .candidate)
         let arbitrary = StatusControllerLease(incarnation: UUID(), connectionToken: UUID(), connectionID: UUID(), storageEpoch: pending.snapshot.storageEpoch, controllerGeneration: 1)
         await expect(.staleLease) { _ = try await fixture.handles.controller.status(over: arbitrary) }
-        try await host.confirmCandidate(candidateID: candidate.candidateID)
+        let returned = try await host.confirmCandidate(candidateID: candidate.candidateID)
         let committed = try await host.localStatus()
+        XCTAssertEqual(returned, committed.snapshot)
         XCTAssertEqual(committed.controllerState, .enrolled)
         XCTAssertEqual(committed.enrollment, .closed)
         XCTAssertEqual(committed.snapshot.controllerID, pending.snapshot.controllerID)

@@ -11,6 +11,7 @@ struct HostView: View {
                 Text(model.commandsAvailability).font(.headline).accessibilityIdentifier("commandsUnavailable")
                 Text(model.isListening ? "Hosting status only" : (model.isEnabled ? "Disconnected" : "Hosting disabled"))
                 Text("Controller: \(model.controllerState)")
+                if let notice = model.committedNotice { Text(notice).accessibilityLabel(notice) }
                 if let error = model.errorMessage { Text(error).foregroundStyle(.red).accessibilityLabel("Hosting error: \(error)") }
             }
             Section("Selected local endpoint") {
@@ -19,8 +20,8 @@ struct HostView: View {
                 HStack {
                     Button("Enable hosting") { Task { await model.enable(ipv4: address, port: UInt16(port) ?? 0) } }
                         .disabled(model.isEnabled || model.isBusy)
-                    Button("Disable hosting") { Task { await model.disable() } }
-                        .disabled(!model.isEnabled && !model.isBusy)
+                    Button("Close local policy and hosting") { Task { await model.disable() } }
+                        .disabled(!model.canClose)
                 }
             }
             Section("Enrollment") {
@@ -41,7 +42,7 @@ struct HostView: View {
             }
             Section("Local controller policy") {
                 Button("Revoke controller") { Task { await model.revoke() } }.disabled(!model.canRevoke)
-                Button("Refresh local status") { Task { await model.refresh() } }.disabled(model.isBusy)
+                Button("Load / refresh local policy") { Task { await model.loadLocalPolicy() } }.disabled(model.isBusy)
             }
         }
         .padding().frame(minWidth: 520, minHeight: 440)

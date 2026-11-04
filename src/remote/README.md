@@ -42,8 +42,21 @@ Observable same-read pipelining and response preemption close the connection;
 frozen wire v1 cannot universally detect peer-send timing across separate native
 receives. This is not an arbitrary malicious-peer timing guarantee. Public
 comparison diagnostics are redacted. Host presentation automatically refreshes
-while an invitation or candidate is visible, using owner policy rather than a
-second UI expiry deadline.
+while the owner enrollment phase is nonclosed, including a fixed candidate whose
+send is still pending, using owner policy rather than a second UI expiry deadline.
+
+The Mac starts with no opened policy or listener. Its explicit Load / refresh
+local policy action opens existing committed policy only, with required host
+identity validation and no TLS credential/certificate/listener setup. Revocation
+is available for an enrolled locally loaded slot while hosting is disabled.
+Close remains available for retained owners after failure/revocation; a failed
+owner cannot be silently reopened by Load or Enable. Storage failure during
+listener startup follows that same retained-owner rule. Loading policy from a different directory requires Close. Explicit Enable retains the original fresh-store path.
+
+Trusted confirmation returns a committed snapshot after COMMIT; local reporting
+separates that fact from uncertain acknowledgement delivery. Subsequent readiness
+failure remains visible alongside the known committed notice. Open enrollment
+uses the full owner phase, so an in-progress claim is not offered as a new window.
 
 The status profile adds native TLS, enrollment, Keychain adapters, async ownership,
 backup gating and prototype UI. The remaining sections describe the **legacy

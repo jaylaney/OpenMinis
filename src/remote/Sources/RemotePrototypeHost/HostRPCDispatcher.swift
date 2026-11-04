@@ -12,12 +12,19 @@ public struct HostCandidatePresentation: Sendable, CustomStringConvertible, Cust
     public var description: String { "HostCandidatePresentation(redacted)" }
     public var debugDescription: String { description }
 }
+public enum HostConfirmationOutcome: Equatable, Sendable {
+    case committed(acknowledgementSent: Bool)
+}
 public struct HostPresentation: Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let hasOpenOwner: Bool
+    public let enrollment: StatusEnrollmentState
     public let isEnabled: Bool
     public let isListening: Bool
     public let invitation: Invitation?
     public let candidate: HostCandidatePresentation?
-    public init(isEnabled: Bool, isListening: Bool, invitation: Invitation?, candidate: HostCandidatePresentation?) {
+    public init(isEnabled: Bool, isListening: Bool, invitation: Invitation?, candidate: HostCandidatePresentation?,
+                hasOpenOwner: Bool? = nil, enrollment: StatusEnrollmentState = .closed) {
+        self.hasOpenOwner = hasOpenOwner ?? isEnabled; self.enrollment = enrollment
         self.isEnabled = isEnabled; self.isListening = isListening; self.invitation = invitation; self.candidate = candidate
     }
     public var description: String { "HostPresentation(enabled: \(isEnabled), listening: \(isListening), secrets: redacted)" }
@@ -167,25 +174,30 @@ public actor HostRPCDispatcher {
         return try Invitation(endpoint: endpoint, hostID: opened.hostID, hostPin: opened.hostPin,
                               invitationID: opened.invitationID, secret: opened.secret)
     }
-    func confirmCandidate(candidateID: UUID) async throws {
+    @discardableResult func confirmCandidate(candidateID: UUID) async throws -> HostConfirmationOutcome {
         try check()
         guard let candidate, candidate.accepted.candidateID == candidateID else { throw StatusHostError.invalidCandidate }
         let id = candidate.accepted.connectionID
         _ = try live(id)
         _ = try requireEnrollment(candidate.provenance)
         self.candidate = nil; changed()
-        try await host.confirmCandidate(candidateID: candidateID)
-        _ = try live(id)
-        // Successful commit makes a subsequent fresh enrollment impossible.
-        // Core-closed presentation cleanup may now drop transient provenance;
-        // the exact durable success, fence and live session govern this ACK.
-        let snapshot = try await host.localStatus().snapshot
-        _ = try live(id)
+        // Core returns only after COMMIT; a refusal/unknown commit stays an error.
+        let snapshot = try await host.confirmCandidate(candidateID: candidateID)
         do {
+            _ = try live(id)
             try await pump.send(.enrollmentCommitted(try EnrollmentCommitted(claimDigest: candidate.accepted.claimDigest,
                 controllerID: snapshot.controllerID, generation: snapshot.controllerGeneration)), over: id)
-        } catch { await disconnected(id); throw HostBridgeError.refused }
+            _ = try live(id)
+            return .committed(acknowledgementSent: true)
+        } catch {
+            // Delivery cannot undo a known commit. Readiness is independently
+            // refreshed by the local model and any later failure remains visible.
+            pump.close(connectionID: id)
+            await disconnected(id)
+            return .committed(acknowledgementSent: false)
+        }
     }
+
     func rejectCandidate(candidateID: UUID) async throws {
         try check()
         guard let candidate, candidate.accepted.candidateID == candidateID else { throw StatusHostError.invalidCandidate }
@@ -220,7 +232,14 @@ public actor HostRPCDispatcher {
         guard !fence.isDisabled else { return HostPresentation(isEnabled: false, isListening: false, invitation: nil, candidate: nil) }
         let invitation = window.flatMap { try? Invitation(endpoint: endpoint, hostID: $0.hostID, hostPin: $0.hostPin, invitationID: $0.invitationID, secret: $0.secret) }
         let visible = candidate.map { HostCandidatePresentation(candidateID: $0.accepted.candidateID, comparisonCode: $0.code) }
-        return HostPresentation(isEnabled: true, isListening: listening, invitation: invitation, candidate: visible)
+        // A changed token means the owner read may precede a newly fixed claim.
+        // Keep enrollment unavailable until a current owner read reconciles it.
+        let enrollment: StatusEnrollmentState
+        if token != presentationToken, enrollmentProvenance != nil || openingEnrollment != nil {
+            enrollment = window != nil ? .open : .candidate
+        } else { enrollment = local?.enrollment ?? .closed }
+        return HostPresentation(isEnabled: true, isListening: listening, invitation: invitation, candidate: visible,
+                                hasOpenOwner: true, enrollment: enrollment)
     }
 }
 #endif

@@ -10,6 +10,179 @@ import RemotePrototypeWire
 @testable import RemotePrototypeHost
 
 final class HostBridgeTests: XCTestCase, @unchecked Sendable {
+    // Break: local policy loading depends on TLS setup or cannot revoke offline.
+    func testOfflineExistingPolicyLoadAndRevokeWithoutTransportSetup() async throws {
+        let f = try await HostFixture.open(); defer { f.remove() }
+        let invitation = try await f.service.openEnrollment()
+        let channel = try await f.handshake(invitation: invitation)
+        try await f.prove(channel, invitation: invitation); await channel.waitForRead(3)
+        let displayed = await f.service.presentation()
+        let candidate = try XCTUnwrap(displayed.candidate)
+        try await f.service.confirmCandidate(candidateID: candidate.candidateID)
+        let before = try await f.service.localStatus()
+        await f.service.disable()
+        let transportCalls = BridgeBox(0)
+        let offline = HostService(dependencies: HostDependencies(
+            loadPrivateKey: { transportCalls.set(transportCalls.get() + 1); throw HostBridgeError.unavailable },
+            makeListener: { _, _, _, _ in transportCalls.set(transportCalls.get() + 1); throw HostBridgeError.unavailable },
+            openOwner: { config in try await StatusOnlyHost.open(configuration: config, native: f.native, backupExclusion: BridgeBackup(), queue: f.queue) }))
+        try await offline.openLocalPolicy(configuration: f.configuration)
+        let loaded = try await offline.localStatus()
+        XCTAssertEqual(loaded.snapshot, before.snapshot)
+        XCTAssertEqual(loaded.controllerState, .enrolled)
+        XCTAssertEqual(transportCalls.get(), 0)
+        let presentation = await offline.presentation()
+        XCTAssertTrue(presentation.hasOpenOwner)
+        XCTAssertFalse(presentation.isEnabled)
+        try await offline.revokeController()
+        XCTAssertThrowsError(try JournalDirectoryLock(directory: f.directory))
+        let retained = await offline.presentation()
+        XCTAssertTrue(retained.hasOpenOwner)
+        await offline.disable()
+        _ = try JournalDirectoryLock(directory: f.directory)
+        try await offline.openLocalPolicy(configuration: f.configuration)
+        let revoked = try await offline.localStatus()
+        XCTAssertEqual(revoked.controllerState, .revoked)
+        XCTAssertEqual(revoked.snapshot.controllerGeneration, before.snapshot.controllerGeneration + 1)
+        XCTAssertEqual(transportCalls.get(), 0)
+        await offline.disable()
+    }
+
+    // Break: a local-policy request for B silently reuses A's trusted owner.
+    // A mismatch must preserve A until Close; the next explicit load may select B.
+    func testLocalPolicyLoadRefusesDifferentSelectedDirectoryUntilClose() async throws {
+        let first = try await HostFixture.open(); defer { first.remove() }
+        let second = try await HostFixture.open(random: BridgeChangingRandom()); defer { second.remove() }
+        let firstSnapshot = try await first.service.localStatus()
+        let secondSnapshot = try await second.service.localStatus()
+        XCTAssertNotEqual(firstSnapshot.snapshot.storageEpoch, secondSnapshot.snapshot.storageEpoch)
+        await second.service.disable()
+        do {
+            try await first.service.openLocalPolicy(configuration: second.configuration)
+            XCTFail("different selection reused the current owner")
+        } catch { XCTAssertEqual(error as? HostBridgeError, .unavailable) }
+        let unchanged = try await first.service.localStatus()
+        XCTAssertEqual(unchanged, firstSnapshot)
+        XCTAssertThrowsError(try JournalDirectoryLock(directory: first.directory))
+        _ = try JournalDirectoryLock(directory: second.directory)
+        try await first.service.openLocalPolicy(configuration: first.configuration)
+        await first.service.disable()
+        _ = try JournalDirectoryLock(directory: first.directory)
+        try await first.service.openLocalPolicy(configuration: second.configuration)
+        let selected = try await first.service.localStatus()
+        XCTAssertEqual(selected, secondSnapshot)
+        let presentation = await first.service.presentation()
+        XCTAssertTrue(presentation.hasOpenOwner)
+        XCTAssertFalse(presentation.isEnabled)
+        do {
+            try await first.service.openLocalPolicy(configuration: first.configuration)
+            XCTFail("different selection replaced the locally loaded owner")
+        } catch { XCTAssertEqual(error as? HostBridgeError, .unavailable) }
+        XCTAssertThrowsError(try JournalDirectoryLock(directory: second.directory))
+        await first.service.disable()
+        _ = try JournalDirectoryLock(directory: second.directory)
+    }
+
+    // Break: Close during a held open lets its late completion publish/leak ownership.
+    func testCloseDuringLocalPolicyOpenDiscardsLateOwner() async throws {
+        let gate = BridgeAsyncGate()
+        let f = try await HostFixture.open(openCompletionGate: gate); defer { f.remove() }
+        await f.service.disable()
+        await gate.hold()
+        let opening = Task { try await f.service.openLocalPolicy(configuration: f.configuration) }
+        await gate.waitForArrival()
+        XCTAssertThrowsError(try JournalDirectoryLock(directory: f.directory))
+        await f.service.disable()
+        XCTAssertThrowsError(try JournalDirectoryLock(directory: f.directory))
+        await gate.release()
+        do { try await opening.value; XCTFail("superseded local owner published") } catch {}
+        let closed = await f.service.presentation()
+        XCTAssertFalse(closed.hasOpenOwner)
+        _ = try JournalDirectoryLock(directory: f.directory)
+    }
+
+    // Break: Enable's listener-start catch closes an owner already published
+    // to a readiness read, discarding its original failure and stable lock.
+    func testPublishedOwnerFailureDuringListenerStartRemainsUntilClose() async throws {
+        let changes = BridgeBox(0)
+        let f = try await HostFixture.open(onChange: { changes.update { $0 += 1 } }); defer { f.remove() }
+        await f.service.disable()
+        let gate = BridgeAsyncGate()
+        f.listener.startGate.set(gate)
+        await gate.hold()
+        let enabling = Task { try await f.service.enable(configuration: f.configuration, endpoint: f.endpoint) }
+        await gate.waitForArrival()
+        f.native.failNextRead.set(true)
+        var original: String?
+        do { _ = try await f.service.localStatus(); XCTFail("injected readiness failure succeeded") }
+        catch { original = String(reflecting: error) }
+        XCTAssertNotNil(original)
+        XCTAssertThrowsError(try JournalDirectoryLock(directory: f.directory))
+        let beforeCompletion = changes.get()
+        await gate.release()
+        do { try await enabling.value; XCTFail("failed startup succeeded") } catch {}
+        let failed = await f.service.presentation()
+        XCTAssertTrue(failed.hasOpenOwner)
+        XCTAssertFalse(failed.isEnabled)
+        XCTAssertFalse(failed.isListening)
+        XCTAssertGreaterThan(changes.get(), beforeCompletion)
+        XCTAssertThrowsError(try JournalDirectoryLock(directory: f.directory))
+        do { _ = try await f.service.localStatus(); XCTFail("failed owner became readable") }
+        catch { XCTAssertEqual(String(reflecting: error), original) }
+        do { try await f.service.openLocalPolicy(configuration: f.configuration); XCTFail("local load replaced failed owner") }
+        catch { XCTAssertEqual(String(reflecting: error), original) }
+        do { try await f.service.enable(configuration: f.configuration, endpoint: f.endpoint); XCTFail("Enable replaced failed owner") }
+        catch { XCTAssertEqual(String(reflecting: error), original) }
+        XCTAssertThrowsError(try JournalDirectoryLock(directory: f.directory))
+        await f.service.disable()
+        _ = try JournalDirectoryLock(directory: f.directory)
+    }
+
+    // Break: a network-start error unnecessarily discards otherwise healthy
+    // local policy, making offline controls disappear until another open.
+    func testNetworkStartFailureRetainsHealthyLocalPolicyUntilClose() async throws {
+        let f = try await HostFixture.open(); defer { f.remove() }
+        let before = try await f.service.localStatus()
+        await f.service.disable()
+        f.listener.failStart.set(true)
+        do { try await f.service.enable(configuration: f.configuration, endpoint: f.endpoint); XCTFail("listener failure succeeded") }
+        catch { XCTAssertEqual(error as? HostBridgeError, .unavailable) }
+        let state = await f.service.presentation()
+        XCTAssertTrue(state.hasOpenOwner)
+        XCTAssertFalse(state.isEnabled)
+        XCTAssertFalse(state.isListening)
+        let healthy = try? await f.service.localStatus()
+        XCTAssertEqual(healthy, before)
+        XCTAssertThrowsError(try JournalDirectoryLock(directory: f.directory))
+        try await f.service.openLocalPolicy(configuration: f.configuration)
+        let late = BridgeChannel(); f.listener.accept(late.channel)
+        XCTAssertTrue(late.cancelled)
+        await f.service.disable()
+        _ = try JournalDirectoryLock(directory: f.directory)
+    }
+
+    // Preserve explicit Close cleanup when startup resumes after cancellation.
+    func testCloseDuringHeldListenerStartCannotRetainOrReviveOwner() async throws {
+        let f = try await HostFixture.open(); defer { f.remove() }
+        await f.service.disable()
+        let gate = BridgeAsyncGate()
+        f.listener.startGate.set(gate)
+        await gate.hold()
+        let enabling = Task { try await f.service.enable(configuration: f.configuration, endpoint: f.endpoint) }
+        await gate.waitForArrival()
+        _ = try await f.service.localStatus()
+        XCTAssertThrowsError(try JournalDirectoryLock(directory: f.directory))
+        await f.service.disable()
+        _ = try JournalDirectoryLock(directory: f.directory)
+        await gate.release()
+        do { try await enabling.value; XCTFail("closed startup revived hosting") } catch {}
+        let closed = await f.service.presentation()
+        XCTAssertFalse(closed.hasOpenOwner)
+        XCTAssertFalse(closed.isEnabled)
+        XCTAssertFalse(closed.isListening)
+        _ = try JournalDirectoryLock(directory: f.directory)
+    }
+
     // Resetting a fence or accepting a delayed listener callback revives old hosting.
     func testDirectUnenrolledRevokeLeavesFenceDisabled() async throws {
         let f = try await HostFixture.open()
@@ -95,7 +268,8 @@ final class HostBridgeTests: XCTestCase, @unchecked Sendable {
         let presentation = await f.service.presentation()
         let candidate = try XCTUnwrap(presentation.candidate)
         c.failNextSend.set(true)
-        do { try await f.service.confirmCandidate(candidateID: candidate.candidateID); XCTFail("lost send succeeded") } catch {}
+        let outcome = try await f.service.confirmCandidate(candidateID: candidate.candidateID)
+        XCTAssertEqual(outcome, .committed(acknowledgementSent: false))
         let enrolledStatus = try await f.service.localStatus()
         XCTAssertEqual(enrolledStatus.controllerState, .enrolled)
         let normal = try await f.normal(invitation)
@@ -106,6 +280,87 @@ final class HostBridgeTests: XCTestCase, @unchecked Sendable {
         let replay = try await f.handshake(invitation: invitation, expectChallenge: false)
         await replay.waitForCancel(); XCTAssertEqual(replay.sent.count, 0)
         await f.service.disable()
+    }
+
+    // Break: a transport fence that wins actor resumption relabels a completed
+    // serial-owner commit as failure. Close must also finish releasing its lock.
+    func testCommittedConfirmationSurvivesCloseDuringHeldCommit() async throws {
+        let f = try await HostFixture.open(); defer { f.remove() }
+        let invitation = try await f.service.openEnrollment()
+        let c = try await f.handshake(invitation: invitation)
+        try await f.prove(c, invitation: invitation); await c.waitForRead(3)
+        let displayed = await f.service.presentation()
+        let candidate = try XCTUnwrap(displayed.candidate)
+        let entered = expectation(description: "confirmation inside COMMIT")
+        let release = DispatchSemaphore(value: 0)
+        f.native.onStep.set { sql in
+            if sql == "COMMIT" { f.native.onStep.set(nil); entered.fulfill(); release.wait() }
+        }
+        let confirmation = Task { try await f.service.confirmCandidate(candidateID: candidate.candidateID) }
+        await fulfillment(of: [entered], timeout: 5)
+        let close = Task { await f.service.disable() }
+        await c.waitForCancel()
+        release.signal()
+        let result = try? await confirmation.value
+        await close.value
+        XCTAssertEqual(result, .committed(acknowledgementSent: false))
+        _ = try JournalDirectoryLock(directory: f.directory)
+        try await f.service.openLocalPolicy(configuration: f.configuration)
+        let persisted = try await f.service.localStatus()
+        XCTAssertEqual(persisted.controllerState, .enrolled)
+        await f.service.disable()
+    }
+
+    // Break: an extra post-COMMIT read prevents sending a known committed ACK.
+    // A later real readiness failure must still fence and retain the owner.
+    func testConfirmationUsesCommittedSnapshotAndLaterReadinessFailureRemainsError() async throws {
+        let f = try await HostFixture.open(); defer { f.remove() }
+        let invitation = try await f.service.openEnrollment()
+        let c = try await f.handshake(invitation: invitation)
+        try await f.prove(c, invitation: invitation); await c.waitForRead(3)
+        let displayed = await f.service.presentation()
+        let candidate = try XCTUnwrap(displayed.candidate)
+        f.native.onStep.set { sql in
+            if sql == "COMMIT" { f.native.onStep.set(nil); f.native.failNextRead.set(true) }
+        }
+        let outcome = try? await f.service.confirmCandidate(candidateID: candidate.candidateID)
+        XCTAssertEqual(outcome, .committed(acknowledgementSent: true))
+        if c.sent.count == 3, case .enrollmentCommitted = try c.frame(2) {} else { XCTFail("missing committed ACK") }
+        do { _ = try await f.service.localStatus(); XCTFail("later readiness failure hidden") } catch {}
+        let failed = await f.service.presentation()
+        XCTAssertFalse(failed.isEnabled)
+        XCTAssertTrue(failed.hasOpenOwner)
+        XCTAssertThrowsError(try JournalDirectoryLock(directory: f.directory))
+        await f.service.disable()
+        _ = try JournalDirectoryLock(directory: f.directory)
+    }
+
+    // Break: catching Core failures as uncertain delivery claims a commit that
+    // was refused or whose result is unknown, and prematurely drops ownership.
+    func testConfirmationCommitFailureAndUnknownOutcomeStayErrors() async throws {
+        for unknown in [false, true] {
+            let f = try await HostFixture.open(); defer { f.remove() }
+            let invitation = try await f.service.openEnrollment()
+            let c = try await f.handshake(invitation: invitation)
+            try await f.prove(c, invitation: invitation); await c.waitForRead(3)
+            let displayed = await f.service.presentation()
+            let candidate = try XCTUnwrap(displayed.candidate)
+            if unknown { f.native.unknownCommit.set(true) } else { f.native.failNextCommit.set(true) }
+            do { _ = try await f.service.confirmCandidate(candidateID: candidate.candidateID); XCTFail("Core failure reported committed") }
+            catch {
+                if unknown { XCTAssertTrue(error is JournalCommitOutcomeUnknownError) }
+                else { XCTAssertTrue(error is JournalStorageError) }
+            }
+            XCTAssertTrue(c.cancelled)
+            XCTAssertEqual(c.sent.count, 2)
+            let failed = await f.service.presentation()
+            XCTAssertFalse(failed.isEnabled)
+            XCTAssertTrue(failed.hasOpenOwner)
+            do { try await f.service.enable(configuration: f.configuration, endpoint: f.endpoint); XCTFail("failed owner replaced") } catch {}
+            XCTAssertThrowsError(try JournalDirectoryLock(directory: f.directory))
+            await f.service.disable()
+            _ = try JournalDirectoryLock(directory: f.directory)
+        }
     }
 
     // Cancellation must happen before the queued durable revoke is allowed to run;
@@ -236,6 +491,7 @@ final class HostBridgeTests: XCTestCase, @unchecked Sendable {
         await c.waitForSend(2)
         let waiting = await f.service.presentation()
         XCTAssertNil(waiting.candidate)
+        XCTAssertEqual(waiting.enrollment, .candidate)
         do { try await f.service.confirmCandidate(candidateID: UUID()); XCTFail("premature confirm") }
         catch { XCTAssertEqual(error as? StatusHostError, .invalidCandidate) }
         c.releaseSend()
@@ -282,6 +538,9 @@ final class HostBridgeTests: XCTestCase, @unchecked Sendable {
         XCTAssertThrowsError(try JournalDirectoryLock(directory: f.directory))
         let state = await f.service.presentation()
         XCTAssertFalse(state.isEnabled)
+        XCTAssertTrue(state.hasOpenOwner)
+        do { try await f.service.openLocalPolicy(configuration: f.configuration); XCTFail("failed owner reopened") } catch {}
+        XCTAssertThrowsError(try JournalDirectoryLock(directory: f.directory))
         XCTAssertFalse(String(reflecting: state).contains("secret-storage-error"))
         await f.service.disable()
         _ = try JournalDirectoryLock(directory: f.directory)

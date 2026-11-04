@@ -8,6 +8,119 @@ import CryptoKit
 @testable import RemoteHostPrototypeModel
 
 @MainActor final class HostModelTests: XCTestCase {
+    // Break: offline enrolled policy cannot be revoked, or refresh opens owners.
+    func testExplicitLocalLoadAllowsOfflineRevokeAndClose() async throws {
+        let service = FakeHostService()
+        service.state = "enrolled"
+        let model = HostModel(service: service, directory: URL(fileURLWithPath: "/unused"))
+        await model.refresh()
+        XCTAssertEqual(service.localLoadCount, 0)
+        XCTAssertFalse(model.canRevoke)
+        await model.loadLocalPolicy()
+        XCTAssertEqual(service.localLoadCount, 1)
+        XCTAssertFalse(model.isEnabled)
+        XCTAssertTrue(model.hasOpenOwner)
+        XCTAssertTrue(model.canClose)
+        XCTAssertTrue(model.canRevoke)
+        await model.revoke()
+        XCTAssertEqual(model.controllerState, "revoked")
+        XCTAssertTrue(model.canClose)
+        await model.disable()
+        XCTAssertFalse(model.hasOpenOwner)
+        XCTAssertFalse(model.canClose)
+    }
+    // Break: nonclosed owner phase with no displayed secret permits a second open.
+    func testEnrollmentGateUsesOwnerPhaseIncludingHeldCandidateSend() async throws {
+        let service = FakeHostService()
+        let ticks = PresentationTicks()
+        let model = HostModel(service: service, directory: URL(fileURLWithPath: "/unused"), presentationRefreshWait: { await ticks.wait() })
+        await model.enable(endpoint: try endpoint())
+        XCTAssertTrue(model.canEnroll)
+        await model.openEnrollment()
+        XCTAssertFalse(model.canEnroll)
+        await model.openEnrollment()
+        XCTAssertEqual(service.openEnrollmentCount, 1)
+        service.invitation = nil
+        service.enrollmentOverride = .candidate
+        await model.refresh()
+        XCTAssertNil(model.candidate)
+        XCTAssertFalse(model.canEnroll)
+        await settlePresentationTasks()
+        XCTAssertEqual(ticks.pendingCount, 1)
+        let before = service.presentationCount
+        ticks.fireNext()
+        await settlePresentationTasks()
+        XCTAssertEqual(service.presentationCount, before + 1)
+        await model.openEnrollment()
+        XCTAssertEqual(service.openEnrollmentCount, 1)
+        service.candidate = HostCandidatePresentation(candidateID: UUID(), comparisonCode: "12345678")
+        await model.refresh()
+        XCTAssertNotNil(model.candidate)
+        XCTAssertFalse(model.canEnroll)
+        service.candidate = nil
+        service.enrollmentOverride = .closed
+        await model.refresh()
+        XCTAssertTrue(model.canEnroll)
+        await model.disable()
+        ticks.fireAll()
+    }
+    // Break: a known commit is lost when its following readiness refresh fails.
+    func testCommittedNoticeSurvivesReadinessFailure() async throws {
+        let service = FakeHostService()
+        let model = HostModel(service: service, directory: URL(fileURLWithPath: "/unused"))
+        await model.enable(endpoint: try endpoint())
+        service.candidate = HostCandidatePresentation(candidateID: UUID(), comparisonCode: "12345678")
+        await model.refresh()
+        service.failReadinessAfterConfirm = true
+        await model.confirm()
+        XCTAssertNotNil(model.committedNotice)
+        XCTAssertNotNil(model.errorMessage)
+        XCTAssertTrue(model.canClose)
+        XCTAssertFalse(model.isEnabled)
+        await model.disable()
+    }
+
+    // Break: without an availability callback, Enable failure never refreshes
+    // its retained resource state, hiding Close and the original readiness error.
+    func testEnableErrorRefreshesRetainedOwnerAndReadiness() async throws {
+        let service = FakeHostService()
+        service.enableError = FixtureError.unavailable
+        service.statusError = FixtureError.unavailable
+        let model = HostModel(service: service, directory: URL(fileURLWithPath: "/unused"))
+        await model.enable(endpoint: try endpoint())
+        XCTAssertFalse(model.isEnabled)
+        XCTAssertFalse(model.isListening)
+        XCTAssertFalse(model.isBusy)
+        XCTAssertTrue(model.hasOpenOwner)
+        XCTAssertTrue(model.canClose)
+        XCTAssertTrue(model.errorMessage?.contains("Hosting readiness unavailable") == true)
+        XCTAssertFalse(model.canEnroll)
+        XCTAssertFalse(model.canRevoke)
+        await model.disable()
+        XCTAssertFalse(model.hasOpenOwner)
+        XCTAssertFalse(model.canClose)
+    }
+
+    // Preserve operation guards when an Enable-error resource read completes
+    // after explicit Close. Its stale retained-owner snapshot cannot restore UI.
+    func testCloseDiscardsHeldEnableErrorResourceRefresh() async throws {
+        let service = FakeHostService()
+        service.enableError = FixtureError.unavailable
+        service.statusError = FixtureError.unavailable
+        service.holdNextPresentation = true
+        let model = HostModel(service: service, directory: URL(fileURLWithPath: "/unused"))
+        let enabling = Task { await model.enable(endpoint: try endpoint()) }
+        await service.waitForHeldPresentation()
+        await model.disable()
+        service.releasePresentation()
+        try await enabling.value
+        XCTAssertFalse(model.isEnabled)
+        XCTAssertFalse(model.isBusy)
+        XCTAssertFalse(model.hasOpenOwner)
+        XCTAssertFalse(model.canClose)
+        XCTAssertNil(model.errorMessage)
+    }
+
     // Break: launch/window lifecycle implicitly enables or stops hosting.
     func testLaunchDisabledAndWindowCloseKeepsHosting() async throws {
         let service = FakeHostService()
@@ -87,6 +200,8 @@ import CryptoKit
             XCTAssertNotNil(model.errorMessage)
             XCTAssertFalse(model.canEnroll)
             XCTAssertFalse(model.canRevoke)
+            XCTAssertTrue(model.hasOpenOwner)
+            XCTAssertTrue(model.canClose)
             XCTAssertEqual(model.commandsAvailability, "Commands unavailable")
         }
     }
@@ -321,6 +436,12 @@ import CryptoKit
 
 @MainActor private final class FakeHostService: HostModelService {
     var enabled = false
+    var owned = false
+    var localLoadCount = 0
+    var openEnrollmentCount = 0
+    var enrollmentOverride: StatusEnrollmentState?
+    var failReadinessAfterConfirm = false
+    var enableError: Error?
     var listening = true
     var state = "unenrolled"
     var statusError: Error?
@@ -331,18 +452,29 @@ import CryptoKit
     var observed: CheckedContinuation<Void, Never>?
     private var heldValue: HostPresentation?
     private(set) var presentationCount = 0
-    func enable(directory: URL, endpoint: StatusEndpoint) async throws { enabled = true; listening = true }
-    func disable() async { enabled = false; invitation = nil }
+    func openLocalPolicy(directory: URL) async throws { localLoadCount += 1; owned = true }
+    func enable(directory: URL, endpoint: StatusEndpoint) async throws {
+        owned = true
+        if let enableError { enabled = false; listening = false; throw enableError }
+        enabled = true; listening = true
+    }
+    func disable() async { owned = false; enabled = false; invitation = nil; candidate = nil }
     func revoke() async throws { state = "revoked"; enabled = false }
     func controllerState() async throws -> String { if let statusError { throw statusError }; return state }
     func openEnrollment() async throws {
+        openEnrollmentCount += 1
         invitation = try Invitation(endpoint: StatusEndpoint(ipv4: "100.64.0.1", port: 49152), hostID: UUID(), hostPin: Data(repeating: 1, count: 32), invitationID: UUID(), secret: Data(repeating: 2, count: 32))
     }
-    func confirm(candidateID: UUID) async throws {}
+    func confirm(candidateID: UUID) async throws -> HostConfirmationOutcome {
+        state = "enrolled"; candidate = nil
+        if failReadinessAfterConfirm { statusError = FixtureError.unavailable }
+        return .committed(acknowledgementSent: false)
+    }
     func reject(candidateID: UUID) async throws {}
     func presentation() async -> HostPresentation {
         presentationCount += 1
-        let value = HostPresentation(isEnabled: enabled, isListening: enabled && listening, invitation: invitation, candidate: candidate)
+        let value = HostPresentation(isEnabled: enabled, isListening: enabled && listening, invitation: invitation, candidate: candidate,
+            hasOpenOwner: owned, enrollment: enrollmentOverride ?? (candidate != nil ? .candidate : invitation != nil ? .open : .closed))
         if holdNextPresentation {
             holdNextPresentation = false
             heldValue = value
@@ -392,6 +524,7 @@ private final class MutableEnrollmentClock: StatusClock, @unchecked Sendable {
     private var dispatcher: HostRPCDispatcher?
     private var fence: ServiceFence?
     init(clock: MutableEnrollmentClock) { self.clock = clock }
+    func openLocalPolicy(directory: URL) async throws { throw FixtureError.unavailable }
     func enable(directory: URL, endpoint: StatusEndpoint) async throws {
         let spki = P256.Signing.PrivateKey().publicKey.derRepresentation
         let handles = try await StatusOnlyHost.open(configuration: StatusOnlyHostConfiguration(directory: directory,
@@ -409,7 +542,10 @@ private final class MutableEnrollmentClock: StatusClock, @unchecked Sendable {
     func revoke() async throws { try await handles?.host.revokeController() }
     func controllerState() async throws -> String { try await handles?.host.localStatus().controllerState.rawValue ?? "unknown" }
     func openEnrollment() async throws { _ = try await dispatcher?.openEnrollment() }
-    func confirm(candidateID: UUID) async throws { try await dispatcher?.confirmCandidate(candidateID: candidateID) }
+    func confirm(candidateID: UUID) async throws -> HostConfirmationOutcome {
+        guard let dispatcher else { throw FixtureError.unavailable }
+        return try await dispatcher.confirmCandidate(candidateID: candidateID)
+    }
     func reject(candidateID: UUID) async throws { try await dispatcher?.rejectCandidate(candidateID: candidateID) }
     func presentation() async -> HostPresentation {
         await dispatcher?.presentation(listening: true) ?? HostPresentation(isEnabled: false, isListening: false, invitation: nil, candidate: nil)

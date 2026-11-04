@@ -6,6 +6,44 @@ import XCTest
 @testable import RemoteExecutionCore
 
 final class StatusSchemaTests: XCTestCase {
+    // Break: an existing-only local load creates a fresh leaf/policy or resolves
+    // identity/randomness before proving that committed policy exists.
+    func testExistingOnlyOpenRefusesFreshWithoutCreation() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("existing-only-\(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let directory = root.appendingPathComponent("state")
+        let calls = Capture(0)
+        let config = StatusOnlyHostConfiguration(directory: directory, clock: Clock(), random: RefusingRandom(),
+            identityResolver: { _ in calls.change { $0 += 1 }; return Self.key }, onUnavailable: {}, allowsFreshStore: false)
+        XCTAssertThrowsError(try StatusOnlyJournal.open(configuration: config, backupExclusion: Backup()))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+        _ = try JournalStateDirectory.prepare(directory)
+        XCTAssertThrowsError(try StatusOnlyJournal.open(configuration: config, backupExclusion: Backup()))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("admission.sqlite3").path))
+        let main = directory.appendingPathComponent("admission.sqlite3")
+        try Data().write(to: main)
+        XCTAssertThrowsError(try StatusOnlyJournal.open(configuration: config, backupExclusion: Backup()))
+        XCTAssertEqual(try Data(contentsOf: main), Data())
+        XCTAssertEqual(calls.value, 0)
+    }
+
+    // Break: existing-only reopen rejects valid enrolled policy or rewrites IDs/pin.
+    func testExistingOnlyOpenLoadsEnrolledPolicy() throws {
+        try fixture { directory in
+            var journal: StatusOnlyJournal? = try StatusOnlyJournal.open(configuration: configuration(directory), backupExclusion: Backup())
+            let enrolled = try XCTUnwrap(journal).confirm(key: Self.otherKey)
+            journal = nil
+            let config = StatusOnlyHostConfiguration(directory: directory, clock: Clock(), random: RefusingRandom(),
+                identityResolver: { pin in XCTAssertEqual(pin, enrolled.hostPin); return Self.key }, onUnavailable: {}, allowsFreshStore: false)
+            let reopened = try StatusOnlyJournal.open(configuration: config, backupExclusion: Backup())
+            XCTAssertEqual(try reopened.readPolicy(), enrolled)
+        }
+    }
+    private struct RefusingRandom: StatusRandomSource {
+        func bytes(count: Int) throws -> Data { XCTFail("existing-only open requested random bytes"); throw POSIXError(.EIO) }
+    }
+
     // Removing exact-schema or row validation must let one of these malformed
     // disposable stores through. The reference DDL is frozen independently here.
     func testExactReferenceSchemaAndData() throws {
