@@ -5,7 +5,7 @@ import Foundation
 /// ordinary POSIX/ACL privacy, not isolation from hostile code running as this user.
 /// Existing directories and inherited ACLs are never silently repaired.
 enum JournalStateDirectory {
-    static func prepare(_ requestedDirectory: URL) throws -> URL {
+    static func prepare(_ requestedDirectory: URL, createIfMissing: Bool = true) throws -> URL {
         // Reject ambiguous spelling before resolving anything. In particular, link/.
         // must not make lstat inspect the symlink target instead of the leaf itself.
         let components = requestedDirectory.path.split(separator: "/")
@@ -31,6 +31,7 @@ enum JournalStateDirectory {
         if lstat(directory.path, &info) != 0 {
             let code = errno
             guard code == ENOENT else { throw invalid("Cannot inspect journal state directory", code: code) }
+            guard createIfMissing else { throw invalid("Journal state directory does not exist", code: code) }
             // Do not create or change parents. The host must provision a trusted parent.
             if mkdir(directory.path, mode_t(0o700)) != 0 {
                 let creationCode = errno
